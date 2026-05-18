@@ -1,5 +1,5 @@
 // All install-package tests. Aliased imports keep the original test bodies
-// unmodified after the install.zig 5005-LoC monolith was split into the
+// unmodified after install.zig was split into the
 // install/ package (plan, services, udev, migration, mappings, phase).
 
 const std = @import("std");
@@ -43,6 +43,7 @@ const freeArgv = services_mod.freeArgv;
 const UdevEntry = udev_mod.UdevEntry;
 const isValidIdentifier = udev_mod.isValidIdentifier;
 const probeAndUnbindDrivers = udev_mod.probeAndUnbindDrivers;
+const probeAndRebindDrivers = udev_mod.probeAndRebindDrivers;
 const readSysHex = udev_mod.readSysHex;
 const findDevicesSourceDir = udev_mod.findDevicesSourceDir;
 const imu_udev_rules_content = udev_mod.imu_udev_rules_content;
@@ -272,6 +273,20 @@ test "install: generateServiceContent is user unit" {
     try testing.expect(std.mem.indexOf(u8, content, "User=") == null);
 }
 
+test "install: generateServiceContent user unit has SupplementaryGroups=input" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try generateServiceContent(allocator, "/usr");
+    defer allocator.free(content);
+    // The headless/linger user daemon needs the 'input' GID to reach
+    // group-owned hidraw nodes. Strict newline boundaries pin it as its own
+    // directive line.
+    // Falsifiability: revert SupplementaryGroups=input in generateServiceContent → this fails.
+    try testing.expect(std.mem.indexOf(u8, content, "\nSupplementaryGroups=input\n") != null);
+    // Coexists with the user-unit invariant: still no User= directive.
+    try testing.expect(std.mem.indexOf(u8, content, "User=") == null);
+}
+
 test "install: generateUdevRules produces valid output" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -311,10 +326,13 @@ test "install: generateUdevRules produces valid output" {
     try testing.expect(std.mem.indexOf(u8, content, "2401") != null);
     try testing.expect(std.mem.indexOf(u8, content, "SUBSYSTEM==\"hidraw\"") != null);
     try testing.expect(std.mem.indexOf(u8, content, "SUBSYSTEM==\"input\"") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "TAG+=\"uaccess\"") != null); // hidraw rule
+    // hidraw line keeps uaccess and adds GROUP="input", MODE="0660" for
+    // headless/linger fallback, VID/PID-scoped.
+    // Falsifiability: revert udev.zig hidraw format-string append → this fails.
+    try testing.expect(std.mem.indexOf(u8, content, "SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"37d7\", ATTRS{idProduct}==\"2401\", TAG+=\"uaccess\", GROUP=\"input\", MODE=\"0660\"") != null);
     try testing.expect(std.mem.indexOf(u8, content, "GROUP=\"input\", MODE=\"0660\"") != null);
     try testing.expect(std.mem.indexOf(u8, content, "KERNEL==\"uinput\"") != null);
-    // ADR-015: /dev/uhid must get uaccess so the user service can create
+    // /dev/uhid must get uaccess so the user service can create
     // virtual SDL-visible gamepads without CAP_SYS_ADMIN.
     try testing.expect(std.mem.indexOf(u8, content, "KERNEL==\"uhid\"") != null);
 }
@@ -415,7 +433,7 @@ test "install: findMappingsSourceDir falls back to cwd mappings" {
     try testing.expectEqualStrings(cwd_mappings, found.?);
 }
 
-// --- Phase 1+2: immutable OS detection, options, path routing ---
+// --- immutable OS detection, options, path routing ---
 
 test "install: InstallOptions defaults" {
     const opts = InstallOptions{};
@@ -564,11 +582,9 @@ test "install: generateSystemServiceContent uses StateDirectory (not LogsDirecto
     try testing.expect(std.mem.indexOf(u8, content, "LogsDirectory") == null);
 }
 
-test "install: generateSystemServiceContent grants /dev/uhid DeviceAllow (ADR-015)" {
-    // ADR-015 §Dependencies: the UHID migration needs /dev/uhid access
-    // parallel to /dev/uinput. Pre-fix the template listed only hidraw,
-    // uinput, and char-input — UhidDevice.init would have failed with
-    // EACCES on a default install.
+test "install: generateSystemServiceContent grants /dev/uhid DeviceAllow" {
+    // /dev/uhid is needed parallel to /dev/uinput; without it UhidDevice.init
+    // fails with EACCES on a default install.
     const testing = std.testing;
     const allocator = testing.allocator;
     const content = try generateSystemServiceContent(allocator, "/usr/local");
@@ -612,13 +628,13 @@ test "install: parseYesNoDefaultYes non-y non-n input is treated as no" {
     try std.testing.expect(!parseYesNoDefaultYes("asdf"));
 }
 
-// --- Phase 3: resume service cleanup, reconnect script, hotplug rules ---
+// --- resume service cleanup, reconnect script, hotplug rules ---
 
-// issue #131 Problem B: padctl-resume.service was broken by design (never
-// enabled, scope-mismatched, ExecStart targeted a nonexistent system unit)
-// and is now removed. The udev reconnect hook (padctl-reconnect) handles
-// hotplug after suspend/resume. These tests lock in that the installer
-// neither writes the unit nor leaves legacy copies behind on upgrade.
+// padctl-resume.service was broken by design (never enabled, scope-mismatched,
+// ExecStart targeted a nonexistent system unit) and is now removed. The udev
+// reconnect hook (padctl-reconnect) handles hotplug after suspend/resume.
+// These tests lock in that the installer neither writes the unit nor leaves
+// legacy copies behind on upgrade.
 
 // Scoped fd-1 silencer for tests that drive run()/uninstall() directly.
 // Those functions emit user-facing progress on STDOUT_FILENO (fd 1).
@@ -685,8 +701,7 @@ test "uninstall: legacy padctl-resume.service is removed (system immutable)" {
     defer allocator.free(staging);
 
     // Seed a fake legacy resume unit at the immutable user-scope location
-    // — this is exactly where v0.1.2 installs wrote the unit on immutable
-    // systems (issue #131 Problem B scope-mismatch).
+    // — where older installs wrote the unit on immutable systems.
     const legacy_dir = try std.fmt.allocPrint(allocator, "{s}/etc/systemd/user", .{staging});
     defer allocator.free(legacy_dir);
     try ensureDirAll(allocator, legacy_dir);
@@ -716,8 +731,7 @@ test "uninstall: legacy padctl-resume.service is removed (system immutable)" {
     } else |_| {}
 }
 
-// T-H1: non-immutable + non-/usr prefix must also clean /etc/systemd/user/
-// padctl-resume.service (issue #131-B uninstall gap — H1 fix).
+// Non-immutable + non-/usr prefix must also clean /etc/systemd/user/padctl-resume.service.
 test "uninstall: legacy padctl-resume.service is removed (non-immutable)" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -964,7 +978,7 @@ test "install: clone_vid_pid=false produces no per-VID/PID rule" {
     try testing.expect(std.mem.indexOf(u8, content, "ATTRS{id/vendor}") == null);
 }
 
-// --- Phase 4: kernel driver blocking ---
+// --- kernel driver blocking ---
 
 test "install: parseStringArray parses TOML inline array" {
     const testing = std.testing;
@@ -1293,7 +1307,7 @@ test "install: generateDriverBlockRules skips when no drivers configured" {
     return error.TestUnexpectedResult;
 }
 
-// --- issue #137: conditional driver-block + service-enabled sentinel ---
+// --- conditional driver-block + service-enabled sentinel ---
 
 // Builds a single-driver entry list and generates the driver-block rules with
 // an explicit sentinel path. Caller owns nothing extra; entries are stack-lived.
@@ -1486,7 +1500,7 @@ test "install: #137 shouldProactiveUnbind truth table" {
     }
 }
 
-// --- Phase 5: mapping installation ---
+// --- mapping installation ---
 
 test "install: installMapping copies mapping to /etc/padctl/mappings/" {
     const testing = std.testing;
@@ -1972,7 +1986,7 @@ test "install: udev rules must not contain SYSTEMD_WANTS" {
     try testing.expect(std.mem.indexOf(u8, content, "TAG+=\"systemd\"") == null);
 }
 
-test "install: user unit has no systemd 257+ incompatible hardening (issue #216)" {
+test "install: user unit has no systemd 257+ incompatible hardening" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const content = try generateServiceContent(allocator, "/usr");
@@ -1982,7 +1996,9 @@ test "install: user unit has no systemd 257+ incompatible hardening (issue #216)
     try testing.expect(std.mem.indexOf(u8, content, "NoNewPrivileges=") == null);
     try testing.expect(std.mem.indexOf(u8, content, "LockPersonality=") == null);
     try testing.expect(std.mem.indexOf(u8, content, "ProtectClock=") == null);
-    try testing.expect(std.mem.indexOf(u8, content, "SupplementaryGroups") == null);
+    // SupplementaryGroups=input is NOT a systemd 257+ incompatible directive
+    // and intentionally stays in the user unit; only the hardening triad above
+    // is forbidden.
     try testing.expect(std.mem.indexOf(u8, content, "StateDirectory=padctl") != null);
 }
 
@@ -2283,9 +2299,9 @@ test "install: planSystemctlUser decides direct/sudo_hop/skip" {
     }
 }
 
-// Regression tests for issue #139 v3 — the install gate that decides whether
-// to call ensureUserXdgDirs must fire on every path that eventually starts a
-// user-scope padctl.service, including the root+SUDO_USER sudo_hop path.
+// The install gate that decides whether to call ensureUserXdgDirs must fire on
+// every path that eventually starts a user-scope padctl.service, including the
+// root+SUDO_USER sudo_hop path.
 test "install: ensureUserXdgDirs called when non-root user-service install" {
     const testing = std.testing;
     // is_root=false, --user-service omitted (effective=true via `!is_root`),
@@ -2295,9 +2311,9 @@ test "install: ensureUserXdgDirs called when non-root user-service install" {
 
 test "install: ensureUserXdgDirs called when sudo install without --user-service (sudo_hop case)" {
     const testing = std.testing;
-    // The failure mode from issue #139 v3: `sudo padctl install` with no flag.
-    // effective_user_service resolves to false, yet run() still invokes
-    // `systemctl --user start` via sudo_hop — the gate must return true.
+    // `sudo padctl install` with no flag: effective_user_service resolves to
+    // false, yet run() still invokes `systemctl --user start` via sudo_hop —
+    // the gate must return true.
     try testing.expect(installWillStartUserService(true, null, "", "jim"));
 }
 
@@ -2333,10 +2349,10 @@ test "install: explicit --no-user-service returns false regardless of sudo_hop" 
     try testing.expect(!installWillStartUserService(true, false, "/tmp/staging", "jim"));
 }
 
-// InstallPlan decision-axis matrix — guards against PR #148-class regressions
-// where a single boolean decision drifts apart between compute time and use
-// time. Each case pins every derived axis to an expected value so the matrix
-// doubles as behavioural spec.
+// InstallPlan decision-axis matrix — guards against regressions where a single
+// boolean decision drifts apart between compute time and use time. Each case
+// pins every derived axis to an expected value so the matrix doubles as
+// behavioural spec.
 test "install: InstallPlan case A — non-root default" {
     const testing = std.testing;
     const opts = InstallOptions{};
@@ -2351,10 +2367,10 @@ test "install: InstallPlan case A — non-root default" {
     try testing.expectEqual(SystemctlUserMode.direct, plan.systemctl_plan.mode);
 }
 
-test "install: InstallPlan case B — sudo_hop (issue #139 v3 regression)" {
-    // The PR #148 failure path: `sudo padctl install` with no flag. Without
-    // the gate fix, do_xdg_dirs flipped false and systemd v254+ recreated the
-    // legacy migration symlink after every install.
+test "install: InstallPlan case B — sudo_hop" {
+    // `sudo padctl install` with no flag: without the gate fix, do_xdg_dirs
+    // flipped false and systemd v254+ recreated the legacy migration symlink
+    // after every install.
     const testing = std.testing;
     const opts = InstallOptions{};
     const env = EnvSnapshot{ .uid = 0, .home = "/root", .sudo_user = "alice", .sudo_uid = "1000" };
@@ -2585,7 +2601,7 @@ test "install: ensureUserXdgDirs replaces broken .local/state/padctl symlink wit
 // compatibility symlink (exec-invoke.c:3044-3072 legacy migration) when the
 // state dir is missing. We force the state dir to be a real directory so that
 // symlink never has a reason to exist and StateDirectory= semantics are
-// preserved — see ensureUserXdgDirs for the full explanation. Issue #139.
+// preserved — see ensureUserXdgDirs for the full explanation.
 test "install: ensureUserXdgDirs replaces valid .local/state/padctl symlink with real dir (systemd v254+ migration workaround)" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2846,9 +2862,9 @@ test "uninstall: removes /etc/systemd/user/padctl.service on non-immutable /usr/
 }
 
 // -----------------------------------------------------------------------------
-// Phase 13 Wave 5 — static udev rule tests. These validate the embedded
-// `imu_udev_rules_content` and the on-disk `udev/90-padctl.rules` are well-
-// formed and carry the critical ENV tags. Layer 0 only — no systemd needed.
+// Static udev rule tests — validate the embedded `imu_udev_rules_content` and
+// the on-disk `udev/90-padctl.rules` are well-formed and carry the critical
+// ENV tags. Layer 0 only — no systemd needed.
 // -----------------------------------------------------------------------------
 
 test "install: imu_udev_rules_content matches input subsystem and padctl uniq" {
@@ -2984,5 +3000,129 @@ test "tomlEscape: round-trip via real TOML parser" {
         const parsed = try parser.parseString(toml_text);
         defer parsed.deinit();
         try std.testing.expectEqualStrings(input, parsed.value.name);
+    }
+}
+
+// probeAndRebindDrivers is the inverse of probeAndUnbindDrivers.
+// It must rebind a matching device's unbound interface, leave an already-bound
+// interface alone, and ignore non-matching devices.
+// Falsifiability: deleting the `f.writeAll(child.name)` line in
+// rebindInterfaces (udev.zig) makes the "1-1.4:1.0" bind assertion fail.
+test "uninstall: probeAndRebindDrivers binds unbound matching interface only" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    try tmp.dir.makePath("sys/bus/usb/drivers/xpad");
+    // Matching device 37d7:2401 with an UNBOUND interface (no driver symlink).
+    try tmp.dir.makePath("sys/bus/usb/devices/1-1.4/1-1.4:1.0");
+    // Matching device with an already-BOUND interface (has driver symlink).
+    try tmp.dir.makePath("sys/bus/usb/devices/1-1.4/1-1.4:1.1");
+    // Non-matching device.
+    try tmp.dir.makePath("sys/bus/usb/devices/2-2.1/2-2.1:1.0");
+
+    {
+        var f = try tmp.dir.createFile("sys/bus/usb/devices/1-1.4/idVendor", .{});
+        defer f.close();
+        try f.writeAll("37d7\n");
+    }
+    {
+        var f = try tmp.dir.createFile("sys/bus/usb/devices/1-1.4/idProduct", .{});
+        defer f.close();
+        try f.writeAll("2401\n");
+    }
+    {
+        var f = try tmp.dir.createFile("sys/bus/usb/devices/2-2.1/idVendor", .{});
+        defer f.close();
+        try f.writeAll("0000\n");
+    }
+    {
+        var f = try tmp.dir.createFile("sys/bus/usb/devices/2-2.1/idProduct", .{});
+        defer f.close();
+        try f.writeAll("0000\n");
+    }
+
+    // Mark 1-1.4:1.1 as already bound.
+    {
+        const drv = try std.fmt.allocPrint(allocator, "{s}/sys/bus/usb/devices/1-1.4/1-1.4:1.1/driver", .{tmp_path});
+        defer allocator.free(drv);
+        // Relative target must resolve from the symlink's own directory
+        // (.../devices/1-1.4/1-1.4:1.1/): three "../" reach .../bus/usb/.
+        try std.posix.symlink("../../../drivers/xpad", drv);
+    }
+
+    // bind file: writable regular file simulating the sysfs write target.
+    {
+        var f = try tmp.dir.createFile("sys/bus/usb/drivers/xpad/bind", .{});
+        defer f.close();
+    }
+
+    const entries = [_]UdevEntry{.{
+        .name = "Test Device",
+        .vid = 0x37d7,
+        .pid = 0x2401,
+        .block_kernel_drivers = &[_][]const u8{"xpad"},
+    }};
+    probeAndRebindDrivers(allocator, &entries, tmp_path);
+
+    const bind_path = try std.fmt.allocPrint(allocator, "{s}/sys/bus/usb/drivers/xpad/bind", .{tmp_path});
+    defer allocator.free(bind_path);
+    var bf = try std.fs.openFileAbsolute(bind_path, .{});
+    defer bf.close();
+    const written = try bf.readToEndAlloc(allocator, 128);
+    defer allocator.free(written);
+    // Only the unbound interface 1-1.4:1.0 is written; the already-bound
+    // 1-1.4:1.1 and non-matching 2-2.1:1.0 must be absent.
+    try testing.expectEqualStrings("1-1.4:1.0", written);
+}
+
+// Uninstall must remove 61-padctl-driver-block.rules symmetrically with
+// 60-padctl.rules (uninstall hygiene). Guards the `files[]` entry in uninstall().
+// Falsifiability: deleting "/lib/udev/rules.d/61-padctl-driver-block.rules"
+// from the `files[]` array in phase.zig makes the RuleFileNotRemoved error fire.
+test "uninstall: removes 61-padctl-driver-block.rules" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const staging = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(staging);
+
+    const rules_dir = try std.fmt.allocPrint(allocator, "{s}/usr/local/lib/udev/rules.d", .{staging});
+    defer allocator.free(rules_dir);
+    try ensureDirAll(allocator, rules_dir);
+
+    const rule_60 = try std.fmt.allocPrint(allocator, "{s}/60-padctl.rules", .{rules_dir});
+    defer allocator.free(rule_60);
+    const rule_61 = try std.fmt.allocPrint(allocator, "{s}/61-padctl-driver-block.rules", .{rules_dir});
+    defer allocator.free(rule_61);
+    for ([_][]const u8{ rule_60, rule_61 }) |p| {
+        var f = try std.fs.createFileAbsolute(p, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("# padctl generated\n");
+    }
+
+    const opts = InstallOptions{
+        .prefix = "/usr/local",
+        .destdir = staging,
+        .immutable = false,
+        .user_service = false,
+    };
+    {
+        var silencer = try SilencedStdout.begin();
+        defer silencer.end();
+        try uninstall(allocator, opts);
+    }
+
+    for ([_][]const u8{ rule_60, rule_61 }) |p| {
+        if (std.fs.accessAbsolute(p, .{})) |_| {
+            std.debug.print("uninstall did not remove rule file: {s}\n", .{p});
+            return error.RuleFileNotRemoved;
+        } else |_| {}
     }
 }

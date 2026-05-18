@@ -57,7 +57,7 @@ Without `trigger_threshold`, `LT` / `RT` emit analog axis events only and do not
 
 ## `[remap]`
 
-Top-level button remapping (active when no layer overrides). Keys are ButtonId names, values are target button names, `KEY_*` codes, `mouse_left`/`mouse_right`/`mouse_middle`/`mouse_side`/`mouse_forward`/`mouse_back`, `disabled`, or `macro:<name>`.
+Top-level button remapping (active when no layer overrides). Keys are ButtonId names, values are target button names, `KEY_*` codes, `mouse_left`/`mouse_right`/`mouse_middle`/`mouse_side`/`mouse_extra`/`mouse_forward`/`mouse_back`, `disabled`, or `macro:<name>`.
 
 ```toml
 [remap]
@@ -67,6 +67,42 @@ M3 = "disabled"
 A = "B"
 M4 = "macro:dodge_roll"
 ```
+
+Array values (e.g. `M1 = ["KEY_LEFTMETA", "KEY_1"]`) are parsed and resolved as chord targets (2–4 keys) but are not yet dispatched — chord output is planned for a future release.
+
+### Gesture bindings (tap / hold / double-press)
+
+A `[remap]` value may also be an inline table that binds different actions to
+short press, long press, and double press of the same button:
+
+```toml
+[remap]
+A  = { tap = "KEY_X", hold = "KEY_Y", double = "KEY_Z" }
+B  = { tap = "B", hold = "KEY_LEFTSHIFT" }
+Y  = { tap = "Y", double = "KEY_F" }
+RB = { tap = "RB", hold = "KEY_TAB", hold_ms = 400, double_ms = 200 }
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `tap` | string | — | Action for a short press (fired on release). |
+| `hold` | string | — | Action fired once the button is held past `hold_ms`. |
+| `double` | string | — | Action fired when a second press starts within `double_ms` of the first release. |
+| `hold_ms` | integer (1–5000) | 300 | Hold threshold in milliseconds. |
+| `double_ms` | integer (1–5000) | 250 | Double-press window in milliseconds. |
+
+At least one of `tap` / `hold` / `double` must be set. Each leg is a single
+target (`ButtonId`, `KEY_*`, `mouse_*`, or `disabled`); `macro:<name>` and chord
+arrays are not allowed inside a gesture. An empty table `{}` or an unknown key
+is rejected at parse time; out-of-range thresholds and a base-`[remap]` gesture
+key that collides with a `[[layer]]` `trigger` are rejected at validate time.
+Absent legs simply do nothing.
+
+Latency trade-off: when `double` is set, `tap` cannot fire until the
+double-press window has elapsed (the engine must wait to see whether a second
+press arrives). Without `double`, `tap` fires immediately on release with zero
+added latency. Plain string and chord-array remap forms are unaffected and
+incur no extra latency.
 
 ## `[gyro]`
 
@@ -85,8 +121,9 @@ invert_y = true
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `mode` | string | `"off"` | `"off"` or `"mouse"` |
-| `activate` | string | — | Button name to hold for activation (e.g. `"LS"`, `"hold_RB"`) |
+| `mode` | string | `"off"` | `"off"`, `"mouse"`, or `"joystick"`. In `"joystick"` mode the processed gyro signal is routed to a virtual stick axis instead of mouse `REL_X/Y` events. |
+| `target` | string | `"right_stick"` | `"right_stick"` or `"left_stick"`. Selects which stick axis receives the gyro output. Only used when `mode = "joystick"`. |
+| `activate` | string | — | Gate button: bare name (`"LS"`) or `hold_<BTN>` form (`"hold_RB"`) — both are equivalent. For analog triggers (`LT`/`RT`), also set `trigger_threshold`. Omit for always-active. |
 | `sensitivity` | float | — | Overall sensitivity multiplier |
 | `sensitivity_x` | float | — | X-axis sensitivity override |
 | `sensitivity_y` | float | — | Y-axis sensitivity override |
@@ -204,6 +241,16 @@ suppress_gamepad = true
 ### `[layer.adaptive_trigger]`
 
 Per-layer adaptive trigger override. Same fields as top-level `[adaptive_trigger]`.
+
+```toml
+[layer.adaptive_trigger]
+mode = "weapon"
+
+[layer.adaptive_trigger.left]
+start    = 30
+end      = 120
+strength = 200
+```
 
 ## `[adaptive_trigger]`
 

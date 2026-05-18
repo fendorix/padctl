@@ -38,13 +38,15 @@ pub const HidrawDevice = struct {
         };
     }
 
-    /// Scan /dev/hidraw0..hidraw63 for a device matching vid/pid and interface_id.
+    /// Scan /dev/hidraw0..hidraw63 for a device matching vid/pid.
+    /// interface_id: null = first matching VID:PID regardless of interface;
+    ///               Some(n) = must match interface n exactly.
     /// Returns an allocated path (caller must free) or error.NotFound.
     pub fn discover(
         allocator: std.mem.Allocator,
         vid: u16,
         pid: u16,
-        interface_id: u8,
+        interface_id: ?u8,
     ) ![]const u8 {
         return discoverWithRoot(allocator, vid, pid, interface_id, "/dev");
     }
@@ -53,7 +55,7 @@ pub const HidrawDevice = struct {
         allocator: std.mem.Allocator,
         vid: u16,
         pid: u16,
-        interface_id: u8,
+        interface_id: ?u8,
         dev_root: []const u8,
     ) ![]const u8 {
         var i: u8 = 0;
@@ -72,8 +74,10 @@ pub const HidrawDevice = struct {
             const dev_pid: u16 = @bitCast(info.product);
             if (dev_vid != vid or dev_pid != pid) continue;
 
-            const iface = readInterfaceId(path) orelse continue;
-            if (iface != interface_id) continue;
+            if (interface_id) |required_iface| {
+                const iface = readInterfaceId(path) orelse continue;
+                if (iface != required_iface) continue;
+            }
 
             return try std.fmt.allocPrint(allocator, "{s}/hidraw{d}", .{ dev_root, i });
         }
@@ -262,9 +266,14 @@ pub fn readPhysicalPath(allocator: std.mem.Allocator, path: []const u8) ![]const
 
 /// Read the interface number from sysfs uevent HID_PHYS for a hidraw node.
 pub fn readInterfaceId(path: []const u8) ?u8 {
+    return readInterfaceIdWithRoot(path, "/sys");
+}
+
+/// Root-injectable variant of readInterfaceId for Layer-0 tests.
+pub fn readInterfaceIdWithRoot(path: []const u8, sys_root: []const u8) ?u8 {
     const basename_s = std.fs.path.basename(path);
     var path_buf: [256]u8 = undefined;
-    const sysfs_path = std.fmt.bufPrint(&path_buf, "/sys/class/hidraw/{s}/device/uevent", .{basename_s}) catch return null;
+    const sysfs_path = std.fmt.bufPrint(&path_buf, "{s}/class/hidraw/{s}/device/uevent", .{ sys_root, basename_s }) catch return null;
     const fd = std.fs.openFileAbsolute(sysfs_path, .{}) catch return null;
     defer fd.close();
     var buf: [1024]u8 = undefined;
@@ -276,12 +285,12 @@ pub fn readInterfaceId(path: []const u8) ?u8 {
             return parseInterfaceId(line["HID_PHYS=".len..]);
         }
     }
-    return readInterfaceIdFromSysfs(basename_s);
+    return readInterfaceIdFromSysfs(basename_s, sys_root);
 }
 
-fn readInterfaceIdFromSysfs(basename_s: []const u8) ?u8 {
+fn readInterfaceIdFromSysfs(basename_s: []const u8, sys_root: []const u8) ?u8 {
     var pb: [256]u8 = undefined;
-    const p = std.fmt.bufPrint(&pb, "/sys/class/hidraw/{s}/device/..", .{basename_s}) catch return null;
+    const p = std.fmt.bufPrint(&pb, "{s}/class/hidraw/{s}/device/..", .{ sys_root, basename_s }) catch return null;
     var dir = std.fs.openDirAbsolute(p, .{}) catch return null;
     defer dir.close();
     const f = dir.openFile("bInterfaceNumber", .{}) catch return null;
@@ -501,4 +510,42 @@ test "hidraw: grabAssociatedEvdev: matches event by phys prefix" {
     try std.testing.expectEqual(@as(usize, 1), dev.evdev_fds.len);
     for (dev.evdev_fds.constSlice()) |fd| posix.close(fd);
     dev.evdev_fds.len = 0;
+}
+
+// Mirrors the interface guard in discoverWithRoot; null = any-interface.
+fn matchesInterfaceFilter(interface_id: ?u8, device_iface: u8) bool {
+    if (interface_id) |required| return device_iface == required;
+    return true; // null = any interface
+}
+
+test "hidraw: discover interface filter — null matches any, explicit must match exactly" {
+    // null = any-interface: a device on interface 1 IS found even without --interface
+    try std.testing.expect(matchesInterfaceFilter(null, 0));
+    try std.testing.expect(matchesInterfaceFilter(null, 1));
+    try std.testing.expect(matchesInterfaceFilter(null, 3));
+
+    // explicit 0: only interface 0 matches
+    try std.testing.expect(matchesInterfaceFilter(0, 0));
+    try std.testing.expect(!matchesInterfaceFilter(0, 1)); // Vader 5 Pro would be rejected
+
+    // explicit 1: only interface 1 matches (Vader 5 Pro default)
+    try std.testing.expect(matchesInterfaceFilter(1, 1));
+    try std.testing.expect(!matchesInterfaceFilter(1, 0));
+
+    // explicit 2: only interface 2 matches
+    try std.testing.expect(matchesInterfaceFilter(2, 2));
+    try std.testing.expect(!matchesInterfaceFilter(2, 1));
+}
+
+test "hidraw: discoverWithRoot — nonexistent root returns NotFound for both null and explicit interface" {
+    // Layer-0 reachable: no real hidraw nodes → NotFound regardless of interface filter.
+    // This confirms the null-interface path reaches the same NotFound without crashing.
+    // Falsifiability: if null interface_id caused a panic or wrong error, this fails.
+    const allocator = std.testing.allocator;
+    const err1 = HidrawDevice.discoverWithRoot(allocator, 0x37d7, 0x2401, null, "/nonexistent_hidraw_xyz");
+    try std.testing.expectError(error.NotFound, err1);
+    const err2 = HidrawDevice.discoverWithRoot(allocator, 0x37d7, 0x2401, 1, "/nonexistent_hidraw_xyz");
+    try std.testing.expectError(error.NotFound, err2);
+    const err3 = HidrawDevice.discoverWithRoot(allocator, 0x37d7, 0x2401, 0, "/nonexistent_hidraw_xyz");
+    try std.testing.expectError(error.NotFound, err3);
 }

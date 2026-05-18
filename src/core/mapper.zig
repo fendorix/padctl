@@ -18,6 +18,7 @@ const REL_WHEEL: u16 = c.REL_WHEEL;
 const REL_HWHEEL: u16 = c.REL_HWHEEL;
 
 const remap_mod = @import("remap.zig");
+const gesture_mod = @import("gesture.zig");
 const chord_detector_mod = @import("chord_detector.zig");
 pub const RemapTargetResolved = remap_mod.RemapTargetResolved;
 pub const resolveTarget = remap_mod.resolveTarget;
@@ -52,6 +53,45 @@ const ResolvedRemap = struct {
     suppress: u64,
 };
 
+const GESTURE_TOKEN_SLOTS = gesture_mod.GESTURE_SLOTS * 2;
+
+const GestureTokenEntry = struct {
+    token: u32,
+    src_idx: u6,
+    leg: gesture_mod.GestureLeg,
+};
+
+// Maps live timer tokens armed by the gesture engine back to (slot, leg) so
+// onMacroTimerExpired can route expiry. Bounded by concurrent gesture timers.
+const GestureTokenTable = struct {
+    entries: [GESTURE_TOKEN_SLOTS]?GestureTokenEntry = [_]?GestureTokenEntry{null} ** GESTURE_TOKEN_SLOTS,
+
+    fn put(self: *GestureTokenTable, token: u32, src_idx: u6, leg: gesture_mod.GestureLeg) void {
+        for (&self.entries) |*e| {
+            if (e.* == null) {
+                e.* = .{ .token = token, .src_idx = src_idx, .leg = leg };
+                return;
+            }
+        }
+    }
+
+    fn take(self: *GestureTokenTable, token: u32) ?GestureTokenEntry {
+        for (&self.entries) |*e| {
+            if (e.*) |v| {
+                if (v.token == token) {
+                    e.* = null;
+                    return v;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn clear(self: *GestureTokenTable) void {
+        self.entries = [_]?GestureTokenEntry{null} ** GESTURE_TOKEN_SLOTS;
+    }
+};
+
 pub const Mapper = struct {
     config: *const MappingConfig,
     layer: LayerState,
@@ -63,10 +103,18 @@ pub const Mapper = struct {
     suppressed_buttons: u64,
     injected_buttons: u64,
     pending_tap_release: ?u64,
-    // issue #72: gamepad-button taps emitted by macro timer expiry need one
-    // apply() cycle to reach output before pending_tap_release fires; staged
-    // here, promoted to injected+pending_tap_release at the next apply.
+    // Gamepad-button taps emitted by macro timer expiry need one apply() cycle
+    // to reach output before pending_tap_release fires; staged here, promoted
+    // to injected+pending_tap_release at the next apply.
     macro_timer_tap_pending: u64,
+    gesture_engine: gesture_mod.GestureEngine,
+    gesture_tokens: GestureTokenTable,
+    // Same staging discipline as macro_timer_tap_pending: gamepad taps emitted
+    // from gesture timer expiry need one apply() to reach output.
+    gesture_timer_tap_pending: u64,
+    // Gamepad bits held by an active gesture hold leg; re-asserted each frame
+    // until the hold leg emits its release.
+    gesture_held_gamepad: u64,
     timer_fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
     active_macros: std.ArrayList(MacroPlayer),
@@ -74,7 +122,7 @@ pub const Mapper = struct {
     next_token: u32,
     resolved_base: ResolvedRemap,
     resolved_layers: []ResolvedRemap,
-    // issue #183: in-controller mapping switch. null disables the feature.
+    // In-controller mapping switch via chord detection. null disables the feature.
     chord_detector: ?ChordDetector = null,
 
     pub fn init(config: *const MappingConfig, timer_fd: std.posix.fd_t, allocator: std.mem.Allocator) !Mapper {
@@ -111,6 +159,10 @@ pub const Mapper = struct {
             .injected_buttons = 0,
             .pending_tap_release = null,
             .macro_timer_tap_pending = 0,
+            .gesture_engine = .{},
+            .gesture_tokens = .{},
+            .gesture_timer_tap_pending = 0,
+            .gesture_held_gamepad = 0,
             .timer_fd = timer_fd,
             .allocator = allocator,
             .active_macros = .{},
@@ -124,6 +176,8 @@ pub const Mapper = struct {
     pub fn deinit(self: *Mapper) void {
         self.layer.deinit();
         self.active_macros.deinit(self.allocator);
+        self.gesture_engine.reset();
+        self.gesture_tokens.clear();
         self.timer_queue.deinit();
         freeResolvedRemap(self.allocator, self.resolved_base);
         for (self.resolved_layers) |r| freeResolvedRemap(self.allocator, r);
@@ -136,7 +190,7 @@ pub const Mapper = struct {
 
     // `now_ns` is the ppoll-wakeup CLOCK_MONOTONIC snapshot from the caller;
     // must match the value passed to onMacroTimerExpired() in the same wakeup so
-    // tap/hold boundary decisions see a single timeline (issue #79).
+    // tap/hold boundary decisions see a single timeline.
     pub fn apply(self: *Mapper, delta: GamepadStateDelta, dt_ms: u32, now_ns: i128) !OutputEvents {
         // flush pending tap release from previous frame
         var aux = AuxEventList{};
@@ -146,10 +200,9 @@ pub const Mapper = struct {
             // inject release into emit state at end of this frame
         }
 
-        // [1] merge delta into current state
         self.state.applyDelta(delta);
 
-        // [1.5] trigger threshold: synthesize LT/RT as digital buttons
+        // Synthesize LT/RT as digital buttons when trigger_threshold is configured.
         if (self.config.trigger_threshold) |threshold| {
             const lt_bit = @as(u64, 1) << @intCast(@intFromEnum(ButtonId.LT));
             const rt_bit = @as(u64, 1) << @intCast(@intFromEnum(ButtonId.RT));
@@ -165,7 +218,6 @@ pub const Mapper = struct {
             }
         }
 
-        // [2] layer trigger processing
         const configs = self.config.layer orelse &.{};
         const action = self.layer.processLayerTriggers(configs, self.state.buttons, self.prev.buttons, now_ns);
         var timer_request: ?TimerRequest = null;
@@ -184,21 +236,36 @@ pub const Mapper = struct {
             // Cancel in-flight macros; emit releases for any held keys/buttons.
             for (self.active_macros.items) |*p| p.emitPendingReleases(&aux, &self.injected_buttons);
             self.active_macros.clearRetainingCapacity();
-            // issue #72: discard tap bits staged from a cancelled macro's timer expiry.
+            // Discard tap bits staged from a cancelled macro's timer expiry.
             self.macro_timer_tap_pending = 0;
+            // Cancel in-flight gestures; mirror the macro-cancel above.
+            for (self.gesture_tokens.entries) |maybe| {
+                if (maybe) |e| self.timer_queue.cancel(e.token, now_ns);
+            }
+            self.gesture_tokens.clear();
+            self.gesture_engine.reset();
+            self.gesture_timer_tap_pending = 0;
+            self.gesture_held_gamepad = 0;
         }
 
-        // reset accumulators
         self.suppressed_buttons = 0;
         self.injected_buttons = 0;
 
-        // issue #72: promote macro-timer tap bits staged at last expiry — emit
-        // press this frame, schedule release for the next apply.
+        // Promote macro-timer tap bits staged at last expiry — emit press this
+        // frame, schedule release for the next apply.
         if (self.macro_timer_tap_pending != 0) {
             self.injected_buttons |= self.macro_timer_tap_pending;
             const existing = self.pending_tap_release orelse 0;
             self.pending_tap_release = existing | self.macro_timer_tap_pending;
             self.macro_timer_tap_pending = 0;
+        }
+
+        // Promote gesture-timer tap bits staged at last expiry.
+        if (self.gesture_timer_tap_pending != 0) {
+            self.injected_buttons |= self.gesture_timer_tap_pending;
+            const existing = self.pending_tap_release orelse 0;
+            self.pending_tap_release = existing | self.gesture_timer_tap_pending;
+            self.gesture_timer_tap_pending = 0;
         }
 
         // Suppress layer trigger buttons so they don't leak to uinput output.
@@ -209,9 +276,9 @@ pub const Mapper = struct {
             self.suppressed_buttons |= @as(u64, 1) << @as(u6, @intCast(@intFromEnum(trigger_id)));
         }
 
-        // issue #183: chord switch detection. The selector buttons must not
-        // leak to uinput output while the modifier is held; the supervisor
-        // performs the actual mapping switch in response to chord_switch_request.
+        // Chord switch detection. Selector buttons must not leak to uinput output
+        // while the modifier is held; the supervisor performs the actual mapping
+        // switch in response to chord_switch_request.
         var chord_switch_request: ?u8 = null;
         if (self.chord_detector) |*cd| {
             const cd_now: u64 = @intCast(@max(now_ns, 0));
@@ -223,7 +290,6 @@ pub const Mapper = struct {
         // per-source inject map: null = not mapped, Some = last-write target
         var per_src_inject: [BUTTON_COUNT]?RemapTargetResolved = [_]?RemapTargetResolved{null} ** BUTTON_COUNT;
 
-        // [3] mode processing
         var suppress_dpad_hat: bool = false;
         var suppress_right_stick_gyro: bool = false;
         var suppress_left_stick_gyro: bool = false;
@@ -295,13 +361,13 @@ pub const Mapper = struct {
             );
         }
 
-        // [4] base remap: copy precomputed suppress mask + inject targets
+        // Base remap: copy precomputed suppress mask + inject targets.
         self.suppressed_buttons |= self.resolved_base.suppress;
         for (self.resolved_base.inject, 0..) |t, i| {
             if (t) |target| per_src_inject[i] = target;
         }
 
-        // [5] layer remap: OR-accumulate suppress, last-write-wins for inject
+        // Layer remap: OR-accumulate suppress, last-write-wins for inject.
         if (self.layer.getActiveIndex(configs)) |idx| {
             const lr = &self.resolved_layers[idx];
             self.suppressed_buttons |= lr.suppress;
@@ -310,7 +376,6 @@ pub const Mapper = struct {
             }
         }
 
-        // [6] build aux + injected_buttons from per_src_inject
         for (0..BUTTON_COUNT) |i| {
             const target = per_src_inject[i] orelse continue;
             const src_mask: u64 = @as(u64, 1) << @as(u6, @intCast(i));
@@ -346,28 +411,35 @@ pub const Mapper = struct {
                         remap_mod.applyTarget(target, .release, &aux, &self.injected_buttons, null, null);
                 },
                 .disabled => {},
-                // Chord dispatch lands in PR B-2; B-1 keeps the source button
-                // suppressed (via `precomputeRemap`'s `result.suppress |= ...`)
-                // but emits no chord events yet.
+                // Chord source button is suppressed via precomputeRemap; chord
+                // events are emitted by the chord output pipeline, not here.
                 .chord => {},
+                .gesture => |node| {
+                    if (pressed != prev_pressed) {
+                        const out = self.gesture_engine.onButtonEdge(@intCast(i), node, pressed, now_ns);
+                        self.applyGestureOutcome(@intCast(i), out, &aux, false, now_ns);
+                    }
+                },
             }
         }
 
-        // emit tap event if any
+        // Re-assert gamepad bits held by an active gesture hold leg; the engine
+        // emits press once, so the bit must persist across frames until release.
+        self.injected_buttons |= self.gesture_held_gamepad;
+
         if (action.tap_event) |tap| {
             emitTapEvent(tap, &aux, &self.injected_buttons, &self.pending_tap_release);
         }
 
-        // [8] resume all active macro players; remove finished ones
         var macro_tap_release: u64 = 0;
         var i: usize = 0;
         while (i < self.active_macros.items.len) {
-            // issue #72: re-assert macro-held gamepad bits each frame; injected_buttons
-            // is reset above, but held_gamepad_buttons (set by past `down=`) must persist
+            // Re-assert macro-held gamepad bits each frame; injected_buttons is reset
+            // above, but held_gamepad_buttons (set by past `down=`) must persist
             // across the delay window and outlive same-frame step advancement.
             self.injected_buttons |= self.active_macros.items[i].held_gamepad_buttons;
-            // issue #119: refresh trigger-held flag so repeat-mode macros stop
-            // scheduling restarts once the source button is released.
+            // Refresh trigger-held flag so repeat-mode macros stop scheduling
+            // restarts once the source button is released.
             const src_bit: u64 = @as(u64, 1) << self.active_macros.items[i].trigger_src_idx;
             self.active_macros.items[i].setTriggerHeld((self.state.buttons & src_bit) != 0);
             const done = self.active_macros.items[i].step(
@@ -422,7 +494,7 @@ pub const Mapper = struct {
             emit_state.ry = 0;
         }
 
-        // [7] prev-frame masking: same masks applied to prev before diff
+        // Apply same masks to prev before diff.
         var masked_prev = self.prev;
         masked_prev.buttons = (self.prev.buttons & ~self.suppressed_buttons) | self.injected_buttons;
         masked_prev.synthesizeDpadAxes();
@@ -452,6 +524,74 @@ pub const Mapper = struct {
         return AuxEventList{};
     }
 
+    // Translate one gesture-engine Outcome into output. `from_timer` selects
+    // the gamepad-tap staging path: timer-context taps stage into
+    // gesture_timer_tap_pending so a full press is visible one frame before the
+    // release; apply-context taps use pending_tap_release directly.
+    fn applyGestureOutcome(
+        self: *Mapper,
+        src_idx: u6,
+        out: gesture_mod.Outcome,
+        aux: *AuxEventList,
+        from_timer: bool,
+        now_ns: i128,
+    ) void {
+        if (out.cancel_hold or out.cancel_double) {
+            // Tokens are matched by value at expiry; cancel both the queue
+            // entry and the routing record so a stale expiry is inert.
+            var ti: usize = 0;
+            while (ti < self.gesture_tokens.entries.len) : (ti += 1) {
+                const e = self.gesture_tokens.entries[ti] orelse continue;
+                if (e.src_idx != src_idx) continue;
+                if ((out.cancel_hold and e.leg == .hold) or
+                    (out.cancel_double and e.leg == .double))
+                {
+                    self.timer_queue.cancel(e.token, now_ns);
+                    self.gesture_tokens.entries[ti] = null;
+                }
+            }
+        }
+        for (out.slice()) |em| {
+            switch (em.target) {
+                .gamepad_button => |dst| {
+                    const mask = @as(u64, 1) << @as(u6, @intCast(@intFromEnum(dst)));
+                    switch (em.action) {
+                        .press => {
+                            self.injected_buttons |= mask;
+                            self.gesture_held_gamepad |= mask;
+                        },
+                        .release => {
+                            self.injected_buttons &= ~mask;
+                            self.gesture_held_gamepad &= ~mask;
+                        },
+                        .tap => if (from_timer) {
+                            self.gesture_timer_tap_pending |= mask;
+                        } else {
+                            self.injected_buttons |= mask;
+                            const existing = self.pending_tap_release orelse 0;
+                            self.pending_tap_release = existing | mask;
+                        },
+                    }
+                },
+                else => {
+                    const act: remap_mod.TargetAction = switch (em.action) {
+                        .press => .press,
+                        .release => .release,
+                        .tap => .tap,
+                    };
+                    remap_mod.applyTarget(em.target, act, aux, &self.injected_buttons, null, null);
+                },
+            }
+        }
+        if (out.arm) |a| {
+            const token = self.next_token;
+            self.next_token +%= 1;
+            self.timer_queue.arm(a.deadline_ns, token, now_ns) catch return;
+            self.gesture_tokens.put(token, src_idx, a.leg);
+            self.gesture_engine.setArmToken(src_idx, a.leg, token);
+        }
+    }
+
     // Macro timerfd (slot 4) expiry only — must NOT call onLayerTimerExpired().
     pub fn onMacroTimerExpired(self: *Mapper, now_ns: i128) AuxEventList {
         var aux = AuxEventList{};
@@ -459,6 +599,13 @@ pub const Mapper = struct {
         var buf: [16]timer_queue_mod.Deadline = undefined;
         const expired = self.timer_queue.drainExpired(now_ns, &buf);
         for (expired) |d| {
+            if (self.gesture_tokens.take(d.token)) |ge| {
+                const src_bit = @as(u64, 1) << ge.src_idx;
+                const held = (self.state.buttons & src_bit) != 0;
+                const out = self.gesture_engine.onTimerExpired(ge.src_idx, ge.leg, held, now_ns);
+                self.applyGestureOutcome(ge.src_idx, out, &aux, true, now_ns);
+                continue;
+            }
             var idx: usize = 0;
             while (idx < self.active_macros.items.len) {
                 if (self.active_macros.items[idx].timer_token == d.token) {
@@ -483,8 +630,8 @@ pub const Mapper = struct {
             }
         }
         if (macro_tap_release != 0) {
-            // issue #72: stage tap bits for the next apply rather than promoting
-            // to pending_tap_release here — apply() resets injected_buttons on
+            // Stage tap bits for the next apply rather than promoting to
+            // pending_tap_release here — apply() resets injected_buttons on
             // entry, so a same-cycle pending_tap_release would clear the bit
             // before the gamepad output is ever emitted.
             self.macro_timer_tap_pending |= macro_tap_release;
@@ -570,6 +717,7 @@ fn freeResolvedRemap(allocator: std.mem.Allocator, r: ResolvedRemap) void {
         const t = maybe_target orelse continue;
         switch (t) {
             .chord => |codes| allocator.free(codes),
+            .gesture => |node| allocator.destroy(node),
             else => {},
         }
     }
@@ -601,6 +749,13 @@ fn precomputeRemap(allocator: std.mem.Allocator, remap_map: mapping.RemapMap) !R
                     continue;
                 },
             },
+            .gesture => |spec| remap_mod.resolveGestureTarget(allocator, spec) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => {
+                    std.log.warn("gesture remap on {s} rejected: {s}", .{ entry.key_ptr.*, @errorName(e) });
+                    continue;
+                },
+            },
         };
         result.suppress |= @as(u64, 1) << src_idx;
         result.inject[@intCast(src_idx)] = target;
@@ -626,11 +781,12 @@ fn buttonBit(name: []const u8) u64 {
 
 fn checkGyroActivate(activate: ?[]const u8, buttons: u64) bool {
     const spec = activate orelse return true;
+    if (std.mem.eql(u8, spec, "always")) return true;
     if (std.mem.startsWith(u8, spec, "hold_")) {
         const btn_name = spec["hold_".len..];
         return buttons & buttonBit(btn_name) != 0;
     }
-    return true; // "always" or unrecognized
+    return buttons & buttonBit(spec) != 0;
 }
 
 // --- tests ---
@@ -1110,7 +1266,152 @@ test "mapper: checkGyroActivate: unknown button name returns false" {
     try testing.expect(!checkGyroActivate("hold_UNKNOWN", 0xFFFFFFFF));
 }
 
-// T1: OOM paths
+test "mapper: checkGyroActivate: bare LS gates correctly" {
+    const ls_idx: u6 = @intCast(@intFromEnum(ButtonId.LS));
+    const ls_mask: u64 = @as(u64, 1) << ls_idx;
+    // LS bit set → active
+    try testing.expect(checkGyroActivate("LS", ls_mask));
+    // LS bit clear → inactive
+    try testing.expect(!checkGyroActivate("LS", 0));
+    // Other button set, LS clear → inactive
+    const rb_idx: u6 = @intCast(@intFromEnum(ButtonId.RB));
+    try testing.expect(!checkGyroActivate("LS", @as(u64, 1) << rb_idx));
+}
+
+test "mapper: checkGyroActivate: bare LT gates correctly" {
+    const lt_idx: u6 = @intCast(@intFromEnum(ButtonId.LT));
+    const lt_mask: u64 = @as(u64, 1) << lt_idx;
+    try testing.expect(checkGyroActivate("LT", lt_mask));
+    try testing.expect(!checkGyroActivate("LT", 0));
+}
+
+test "mapper: checkGyroActivate: bogus bare name returns false (not true)" {
+    // Regression: before fix this returned true, making gyro always-on.
+    try testing.expect(!checkGyroActivate("BOGUS_NOT_A_BUTTON", 0xFFFFFFFF));
+}
+
+test "e2e: gyro activate bare LS — no output when LS not pressed, output when pressed" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[gyro]
+        \\mode = "mouse"
+        \\sensitivity = 1000.0
+        \\smoothing = 0.0
+        \\activate = "LS"
+    , allocator);
+    defer parsed.deinit();
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const ls_idx: u6 = @intCast(@intFromEnum(ButtonId.LS));
+    const ls_mask: u64 = @as(u64, 1) << ls_idx;
+
+    // LS not pressed → no gyro output
+    const ev_off = try m.apply(.{ .buttons = 0, .gyro_x = 10000, .gyro_y = 10000 }, 16, 0);
+    for (ev_off.aux.slice()) |e| switch (e) {
+        .rel => return error.UnexpectedRelEvent,
+        else => {},
+    };
+
+    // LS pressed → gyro output
+    const ev_on = try m.apply(.{ .buttons = ls_mask, .gyro_x = 10000, .gyro_y = 10000 }, 16, 0);
+    var has_rel = false;
+    for (ev_on.aux.slice()) |e| switch (e) {
+        .rel => {
+            has_rel = true;
+        },
+        else => {},
+    };
+    try testing.expect(has_rel);
+
+    // LS released → gyro output stops
+    const ev_off2 = try m.apply(.{ .buttons = 0, .gyro_x = 10000, .gyro_y = 10000 }, 16, 0);
+    for (ev_off2.aux.slice()) |e| switch (e) {
+        .rel => return error.UnexpectedRelEvent,
+        else => {},
+    };
+}
+
+test "e2e: gyro activate bare LT — gated through trigger_threshold LT synthesis" {
+    // End-to-end: the analog LT axis crossing trigger_threshold synthesizes the
+    // LT button bit, which the bare-name activate gate then consumes.
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\trigger_threshold = 128
+        \\[gyro]
+        \\mode = "mouse"
+        \\sensitivity = 1000.0
+        \\smoothing = 0.0
+        \\activate = "LT"
+    , allocator);
+    defer parsed.deinit();
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    // LT below threshold → no LT bit synthesized → gyro gated off
+    const ev_off = try m.apply(.{ .lt = 0, .gyro_x = 10000, .gyro_y = 10000 }, 16, 0);
+    for (ev_off.aux.slice()) |e| switch (e) {
+        .rel => return error.UnexpectedRelEvent,
+        else => {},
+    };
+
+    // LT above threshold → LT bit synthesized → gyro fires
+    const ev_on = try m.apply(.{ .lt = 200, .gyro_x = 10000, .gyro_y = 10000 }, 16, 0);
+    var has_rel = false;
+    for (ev_on.aux.slice()) |e| switch (e) {
+        .rel => {
+            has_rel = true;
+        },
+        else => {},
+    };
+    try testing.expect(has_rel);
+}
+
+test "e2e: gyro activate bogus name — gyro always disabled" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[gyro]
+        \\mode = "mouse"
+        \\sensitivity = 1000.0
+        \\smoothing = 0.0
+        \\activate = "BOGUS_NOT_A_BUTTON"
+    , allocator);
+    defer parsed.deinit();
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    // Even with all bits set, unknown name resolves to 0 via buttonBit → gyro off
+    const ev = try m.apply(.{ .buttons = 0xFFFFFFFFFFFFFFFF, .gyro_x = 10000, .gyro_y = 10000 }, 16, 0);
+    for (ev.aux.slice()) |e| switch (e) {
+        .rel => return error.UnexpectedRelEvent,
+        else => {},
+    };
+}
+
+test "e2e: gyro activate hold_LT no trigger_threshold — LT bit never synthesized, gyro stays off" {
+    // Documents the analog-trigger trap: without trigger_threshold the LT bit is
+    // never set in buttons, so hold_LT (and bare LT) never fires.
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[gyro]
+        \\mode = "mouse"
+        \\sensitivity = 1000.0
+        \\smoothing = 0.0
+        \\activate = "hold_LT"
+    , allocator);
+    defer parsed.deinit();
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    // Simulate LT axis fully pressed (lt=255) but no trigger_threshold → bit never set
+    const ev = try m.apply(.{ .lt = 255, .buttons = 0, .gyro_x = 10000, .gyro_y = 10000 }, 16, 0);
+    for (ev.aux.slice()) |e| switch (e) {
+        .rel => return error.UnexpectedRelEvent,
+        else => {},
+    };
+}
+
+// --- OOM path tests ---
 
 test "mapper: Mapper.apply toggle OOM is silently swallowed" {
     const allocator = testing.allocator;
@@ -1165,7 +1466,7 @@ test "mapper: active_macros append OOM is silently ignored" {
     try testing.expectEqual(@as(u64, 0), ev.gamepad.buttons & a_mask);
 }
 
-// T5: AuxEventList overflow
+// --- AuxEventList overflow tests ---
 
 test "mapper: AuxEventList 64-item fill succeeds, 65th returns Overflow" {
     var list = AuxEventList{};
@@ -1691,13 +1992,12 @@ test "mapper: 1000 apply frames with remap produce stable output (no per-frame s
     }
 }
 
-test "mapper: #79 dual-ready ppoll — apply uses caller now_ns, tap fires at press+195ms" {
-    // Issue #79: on a single ppoll wakeup the timerfd (promote PENDING
-    // → ACTIVE) and the device fd (release) can both be ready. Before
-    // the fix, apply() re-read CLOCK_MONOTONIC internally after the
-    // timer handler ran, and the drift pushed a 195ms physical tap
-    // past the 200ms hold_timeout. Now the caller snapshots `now` once
-    // and threads it through both onTimerExpired and apply.
+test "mapper: dual-ready ppoll — apply uses caller now_ns, tap fires at press+195ms" {
+    // On a single ppoll wakeup the timerfd (promote PENDING → ACTIVE) and
+    // the device fd (release) can both be ready. If apply() re-read
+    // CLOCK_MONOTONIC internally after the timer handler ran, the drift would
+    // push a 195ms physical tap past the 200ms hold_timeout. The caller
+    // snapshots `now` once and threads it through both onTimerExpired and apply.
     const allocator = testing.allocator;
     const parsed = try makeMapping(
         \\[[layer]]
@@ -1739,18 +2039,17 @@ test "mapper: #79 dual-ready ppoll — apply uses caller now_ns, tap fires at pr
     try testing.expectEqual(@as(u64, 0), ev_clear.gamepad.buttons & a_mask);
 }
 
-test "mapper: #79 timing boundary sweep — tap fires via .pending branch iff release_ns < hold_timeout_ns" {
+test "mapper: timing boundary sweep — tap fires via .pending branch iff release_ns < hold_timeout_ns" {
     // 7 release_delta × 3 press bases = 21 cases.
     //
-    // Falsifiability (TP1): the tap-fires cases (delta < 200) release the
-    // trigger while the hold timer is STILL PENDING — the timer is never
-    // manually expired, so onTriggerRelease takes the `.pending` branch.
-    // That is the exact #79 race the user reported ("tap, release before the
-    // hold timer fires"). A `macro:hold_x` runs in parallel: a spurious
-    // active_changed reset on the PENDING-press frame (the PR #231 / #79 bug)
-    // calls emitPendingReleases + active_macros.clearRetainingCapacity,
-    // which drops the held X gamepad bit and the active macro. We assert
-    // both on the PENDING-press frame, so re-adding the mutation is visible.
+    // Falsifiability: the tap-fires cases (delta < 200) release the trigger
+    // while the hold timer is STILL PENDING — the timer is never manually
+    // expired, so onTriggerRelease takes the `.pending` branch.
+    // A `macro:hold_x` runs in parallel: a spurious active_changed reset on
+    // the PENDING-press frame calls emitPendingReleases +
+    // active_macros.clearRetainingCapacity, dropping the held X gamepad bit
+    // and the active macro. We assert both on the PENDING-press frame, so
+    // re-adding the mutation is visible.
     //
     // The held-past-hold_timeout cases (delta >= 200) DO expire the timer
     // first → onTriggerRelease takes the legitimate `.active` branch → no tap.
@@ -1800,9 +2099,8 @@ test "mapper: #79 timing boundary sweep — tap fires via .pending branch iff re
             try testing.expectEqual(@as(usize, 1), m.active_macros.items.len);
 
             // Frame B: press LT while M1 still held → Hold PENDING entry.
-            // This is the PENDING-press frame. With PR #231's fix the macro
-            // survives (no active_changed reset); with the mutation re-added
-            // the spurious reset cancels the macro and drops the X bit.
+            // The macro must survive (no spurious active_changed reset); with
+            // the mutation re-added the reset cancels the macro and drops the X bit.
             const ev_pending = try m.apply(.{ .buttons = m1_mask | lt_mask }, 16, press_ns);
             try testing.expect((ev_pending.gamepad.buttons & x_mask) != 0);
             try testing.expectEqual(@as(usize, 1), m.active_macros.items.len);
