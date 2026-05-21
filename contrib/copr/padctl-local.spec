@@ -23,7 +23,7 @@
 %define debug_package %{nil}
 
 Name:           padctl
-Version:        0.1.7
+Version:        0.1.8
 Release:        1%{?dist}
 Summary:        HID gamepad remapper with declarative TOML config
 
@@ -57,6 +57,9 @@ systemd socket activation and udev integration.
 %setup -q -n %{name}-%{version}
 
 %build
+# Clear Zig cache directories to ensure fresh compilation with source changes.
+# Zig caches globally in ~/.cache/zig/ and locally in .zig-cache/ and zig-out/
+rm -rf ~/.cache/zig .zig-cache/ zig-out/
 %{zig_bin} build -Doptimize=ReleaseSafe -Dtarget=native-native %{?_smp_mflags}
 
 %install
@@ -71,6 +74,9 @@ systemd socket activation and udev integration.
 # The installer generates a user service under /usr/lib/systemd/user/.
 # Create a system-service variant for the RPM so the daemon starts at boot
 # without requiring a user session.
+# Note: Omit SupplementaryGroups=input — Fedora uses uaccess/ACL instead of
+# an input group, and systemd fails with exit code 216/GROUP if the group
+# doesn't exist (see commit bd19875c for the user service fix).
 mkdir -p %{buildroot}%{_unitdir}
 cat > %{buildroot}%{_unitdir}/padctl.service << 'EOF'
 [Unit]
@@ -87,7 +93,6 @@ ProtectHome=true
 PrivateTmp=true
 RuntimeDirectory=padctl
 StateDirectory=padctl
-SupplementaryGroups=input
 DeviceAllow=/dev/hidraw* rw
 DeviceAllow=/dev/uinput rw
 DeviceAllow=/dev/uhid rw
