@@ -76,6 +76,8 @@ const PromptResult = mappings_mod.PromptResult;
 // phase.zig
 const run = phase_mod.run;
 const uninstall = phase_mod.uninstall;
+const inputGroupHintNeeded = phase_mod.inputGroupHintNeeded;
+const hostHasInputGroup = plan_mod.hostHasInputGroup;
 
 // stdout silencer used by tests that exercise live install/uninstall paths.
 const SilencedStdout = struct {
@@ -243,7 +245,7 @@ test "install: extractVidPid ignores [output] section vid/pid" {
 test "install: generateServiceContent uses prefix" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr/local");
+    const content = try generateServiceContent(allocator, "/usr/local", true);
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "/usr/local/bin/padctl") != null);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir /usr/local/share/padctl/devices") != null);
@@ -255,7 +257,7 @@ test "install: generateServiceContent uses prefix" {
 test "install: generateServiceContent default prefix omits --config-dir" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr");
+    const content = try generateServiceContent(allocator, "/usr", true);
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "/usr/bin/padctl") != null);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir") == null);
@@ -265,7 +267,7 @@ test "install: generateServiceContent default prefix omits --config-dir" {
 test "install: generateServiceContent is user unit" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr");
+    const content = try generateServiceContent(allocator, "/usr", true);
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "WantedBy=default.target") != null);
     try testing.expect(std.mem.indexOf(u8, content, "ProtectHome") == null);
@@ -273,18 +275,72 @@ test "install: generateServiceContent is user unit" {
     try testing.expect(std.mem.indexOf(u8, content, "User=") == null);
 }
 
-test "install: generateServiceContent user unit has SupplementaryGroups=input" {
+test "install: generateServiceContent emits SupplementaryGroups=input when input group exists" {
+    // Falsifiability: remove the has_input_group branch in generateServiceContent → this fails.
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr");
+    const content = try generateServiceContent(allocator, "/usr", true);
     defer allocator.free(content);
-    // The headless/linger user daemon needs the 'input' GID to reach
-    // group-owned hidraw nodes. Strict newline boundaries pin it as its own
-    // directive line.
-    // Falsifiability: revert SupplementaryGroups=input in generateServiceContent → this fails.
     try testing.expect(std.mem.indexOf(u8, content, "\nSupplementaryGroups=input\n") != null);
-    // Coexists with the user-unit invariant: still no User= directive.
     try testing.expect(std.mem.indexOf(u8, content, "User=") == null);
+}
+
+test "install: generateServiceContent omits SupplementaryGroups=input when input group absent" {
+    // Regression test for issue #279: distros using uaccess/ACL (e.g. Bazzite)
+    // have no 'input' unix group; emitting SupplementaryGroups=input causes
+    // systemd EXIT_GROUP (216) and a restart loop.
+    // Falsifiability: make generateServiceContent always emit the line → this fails.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try generateServiceContent(allocator, "/usr", false);
+    defer allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "SupplementaryGroups=input") == null);
+    try testing.expect(std.mem.indexOf(u8, content, "WantedBy=default.target") != null);
+}
+
+test "install: generateServiceContent group-present output == group-absent + single inserted line" {
+    // Pins the exact byte layout: the only difference between the two cases
+    // must be one inserted "SupplementaryGroups=input\n" line, immediately
+    // after "ExecStart=...\n". A single shared template guarantees this; this
+    // test catches any future divergence between the two cases.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const with_group = try generateServiceContent(allocator, "/usr", true);
+    defer allocator.free(with_group);
+    const without_group = try generateServiceContent(allocator, "/usr", false);
+    defer allocator.free(without_group);
+
+    const marker = "ExecStart=/usr/bin/padctl\n";
+    const idx = std.mem.indexOf(u8, without_group, marker).?;
+    const insert_at = idx + marker.len;
+    const reconstructed = try std.fmt.allocPrint(allocator, "{s}SupplementaryGroups=input\n{s}", .{
+        without_group[0..insert_at],
+        without_group[insert_at..],
+    });
+    defer allocator.free(reconstructed);
+    try testing.expectEqualStrings(reconstructed, with_group);
+}
+
+test "install: generateSystemServiceContent group-present output == group-absent + single inserted line" {
+    // Pins the exact byte layout for the legacy system unit: the only
+    // difference must be one "SupplementaryGroups=input\n" line, immediately
+    // after "StateDirectory=padctl\n".
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const with_group = try generateSystemServiceContent(allocator, "/usr", true);
+    defer allocator.free(with_group);
+    const without_group = try generateSystemServiceContent(allocator, "/usr", false);
+    defer allocator.free(without_group);
+
+    const marker = "StateDirectory=padctl\n";
+    const idx = std.mem.indexOf(u8, without_group, marker).?;
+    const insert_at = idx + marker.len;
+    const reconstructed = try std.fmt.allocPrint(allocator, "{s}SupplementaryGroups=input\n{s}", .{
+        without_group[0..insert_at],
+        without_group[insert_at..],
+    });
+    defer allocator.free(reconstructed);
+    try testing.expectEqualStrings(reconstructed, with_group);
 }
 
 test "install: generateUdevRules produces valid output" {
@@ -563,7 +619,7 @@ test "install: generateServiceContent uses StateDirectory (not LogsDirectory)" {
     // the path between daemon and CLI.
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr/local");
+    const content = try generateServiceContent(allocator, "/usr/local", true);
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "StateDirectory=padctl") != null);
     try testing.expect(std.mem.indexOf(u8, content, "LogsDirectory") == null);
@@ -576,7 +632,7 @@ test "install: generateSystemServiceContent uses StateDirectory (not LogsDirecto
     // legacy unit, its state dir matches what stateDir() resolves to.
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateSystemServiceContent(allocator, "/usr/local");
+    const content = try generateSystemServiceContent(allocator, "/usr/local", true);
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "StateDirectory=padctl") != null);
     try testing.expect(std.mem.indexOf(u8, content, "LogsDirectory") == null);
@@ -587,10 +643,52 @@ test "install: generateSystemServiceContent grants /dev/uhid DeviceAllow" {
     // fails with EACCES on a default install.
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateSystemServiceContent(allocator, "/usr/local");
+    const content = try generateSystemServiceContent(allocator, "/usr/local", true);
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "DeviceAllow=/dev/uhid rw") != null);
     try testing.expect(std.mem.indexOf(u8, content, "DeviceAllow=/dev/uinput rw") != null);
+}
+
+test "install: generateSystemServiceContent emits SupplementaryGroups=input when input group exists" {
+    // Falsifiability: remove the has_input_group branch in generateSystemServiceContent → this fails.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try generateSystemServiceContent(allocator, "/usr", true);
+    defer allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "\nSupplementaryGroups=input\n") != null);
+}
+
+test "install: generateSystemServiceContent omits SupplementaryGroups=input when input group absent" {
+    // Regression test for issue #279: same guard applies to the legacy system unit.
+    // Falsifiability: make generateSystemServiceContent always emit the line → this fails.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try generateSystemServiceContent(allocator, "/usr", false);
+    defer allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "SupplementaryGroups=input") == null);
+    try testing.expect(std.mem.indexOf(u8, content, "DeviceAllow=/dev/uhid rw") != null);
+}
+
+test "install: inputGroupHintNeeded suppressed when host has no input group" {
+    // Falsifiability: remove the has_group guard in inputGroupHintNeeded → this fails.
+    // Distros without an input group (e.g. Bazzite/Fedora) must not show usermod advice.
+    try std.testing.expect(!inputGroupHintNeeded(false, false));
+    try std.testing.expect(!inputGroupHintNeeded(false, true));
+}
+
+test "install: inputGroupHintNeeded shown only when group exists and user not yet a member" {
+    // Falsifiability: remove the !in_group guard → second case fails.
+    try std.testing.expect(inputGroupHintNeeded(true, false));
+    try std.testing.expect(!inputGroupHintNeeded(true, true));
+}
+
+test "install: hostHasInputGroup returns bool (smoke — value is host-dependent)" {
+    // Falsifiability: if hostHasInputGroup always panics, this fails.
+    // We cannot assert the value — it's host-dependent — but we confirm the
+    // function is callable and consistent with groupGid("input").
+    const has = hostHasInputGroup();
+    const gid = plan_mod.groupGid("input");
+    try std.testing.expectEqual(gid != null, has);
 }
 
 test "install: parseYesNoDefaultYes empty input is yes (default-yes)" {
@@ -1989,7 +2087,7 @@ test "install: udev rules must not contain SYSTEMD_WANTS" {
 test "install: user unit has no systemd 257+ incompatible hardening" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr");
+    const content = try generateServiceContent(allocator, "/usr", true);
     defer allocator.free(content);
     // NoNewPrivileges, LockPersonality, ProtectClock cause EXIT_CAPABILITIES (218)
     // in user scope on systemd 257+ — must be absent from the user unit.
@@ -1997,8 +2095,7 @@ test "install: user unit has no systemd 257+ incompatible hardening" {
     try testing.expect(std.mem.indexOf(u8, content, "LockPersonality=") == null);
     try testing.expect(std.mem.indexOf(u8, content, "ProtectClock=") == null);
     // SupplementaryGroups=input is NOT a systemd 257+ incompatible directive
-    // and intentionally stays in the user unit; only the hardening triad above
-    // is forbidden.
+    // when the input group exists; only the hardening triad above is forbidden.
     try testing.expect(std.mem.indexOf(u8, content, "StateDirectory=padctl") != null);
 }
 
@@ -2027,7 +2124,7 @@ test "install: old system unit triggers migration hint" {
 test "install: generateServiceContent /usr prefix omits --config-dir" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr");
+    const content = try generateServiceContent(allocator, "/usr", true);
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir") == null);
     try testing.expect(std.mem.indexOf(u8, content, "ExecStart=/usr/bin/padctl\n") != null);
@@ -2036,7 +2133,7 @@ test "install: generateServiceContent /usr prefix omits --config-dir" {
 test "install: generateServiceContent non-usr prefix includes --config-dir for its own share" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr/local");
+    const content = try generateServiceContent(allocator, "/usr/local", true);
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir /usr/local/share/padctl/devices") != null);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir /usr/share") == null);

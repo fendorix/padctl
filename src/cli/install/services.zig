@@ -9,12 +9,14 @@ const runCmdWarn = plan_mod.runCmdWarn;
 const planSystemctlUser = plan_mod.planSystemctlUser;
 const atomicInstallBinary = plan_mod.atomicInstallBinary;
 
-pub fn generateServiceContent(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+pub fn generateServiceContent(allocator: std.mem.Allocator, prefix: []const u8, has_input_group: bool) ![]const u8 {
     const exec_start = if (std.mem.eql(u8, prefix, "/usr"))
         try std.fmt.allocPrint(allocator, "{s}/bin/padctl", .{prefix})
     else
         try std.fmt.allocPrint(allocator, "{s}/bin/padctl --config-dir {s}/share/padctl/devices", .{ prefix, prefix });
     defer allocator.free(exec_start);
+
+    const group_line: []const u8 = if (has_input_group) "SupplementaryGroups=input\n" else "";
 
     return std.fmt.allocPrint(allocator,
         \\[Unit]
@@ -24,8 +26,7 @@ pub fn generateServiceContent(allocator: std.mem.Allocator, prefix: []const u8) 
         \\[Service]
         \\Type=simple
         \\ExecStart={s}
-        \\SupplementaryGroups=input
-        \\Restart=on-failure
+        \\{s}Restart=on-failure
         \\RestartSec=3
         \\# Canonical state/log dir: $XDG_STATE_HOME/padctl on user services,
         \\# /var/lib/padctl on system services. systemd pre-creates it with
@@ -37,7 +38,7 @@ pub fn generateServiceContent(allocator: std.mem.Allocator, prefix: []const u8) 
         \\[Install]
         \\WantedBy=default.target
         \\
-    , .{exec_start});
+    , .{ exec_start, group_line });
 }
 
 pub const immutable_dropin_content =
@@ -93,12 +94,14 @@ pub fn generateReconnectScript(allocator: std.mem.Allocator, prefix: []const u8)
 
 /// Generate the system service content matching the legacy format but with
 /// correct ExecStart for the given prefix.
-pub fn generateSystemServiceContent(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+pub fn generateSystemServiceContent(allocator: std.mem.Allocator, prefix: []const u8, has_input_group: bool) ![]const u8 {
     const exec_start = if (std.mem.eql(u8, prefix, "/usr"))
         try std.fmt.allocPrint(allocator, "{s}/bin/padctl", .{prefix})
     else
         try std.fmt.allocPrint(allocator, "{s}/bin/padctl --config-dir {s}/share/padctl/devices", .{ prefix, prefix });
     defer allocator.free(exec_start);
+
+    const group_line: []const u8 = if (has_input_group) "SupplementaryGroups=input\n" else "";
 
     return std.fmt.allocPrint(allocator,
         \\[Unit]
@@ -115,8 +118,7 @@ pub fn generateSystemServiceContent(allocator: std.mem.Allocator, prefix: []cons
         \\PrivateTmp=true
         \\RuntimeDirectory=padctl
         \\StateDirectory=padctl
-        \\SupplementaryGroups=input
-        \\DeviceAllow=/dev/hidraw* rw
+        \\{s}DeviceAllow=/dev/hidraw* rw
         \\DeviceAllow=/dev/uinput rw
         \\DeviceAllow=/dev/uhid rw
         \\DeviceAllow=char-input rw
@@ -124,32 +126,33 @@ pub fn generateSystemServiceContent(allocator: std.mem.Allocator, prefix: []cons
         \\[Install]
         \\WantedBy=multi-user.target
         \\
-    , .{exec_start});
+    , .{ exec_start, group_line });
 }
 
 /// Update any legacy system service files left behind by pre-user-service
 /// installs. Without this, upgrades leave stale ExecStart (missing
 /// --config-dir) and stale drop-ins on disk; if a user later re-enables
 /// the legacy unit manually, they would get the old stale content.
-pub fn updateLegacySystemService(allocator: std.mem.Allocator, destdir: []const u8, prefix: []const u8) void {
+pub fn updateLegacySystemService(allocator: std.mem.Allocator, destdir: []const u8, prefix: []const u8, has_input_group: bool) void {
     const etc_dir = std.fmt.allocPrint(allocator, "{s}/etc/systemd/system", .{destdir}) catch return;
     defer allocator.free(etc_dir);
-    updateLegacyAt(allocator, prefix, etc_dir);
+    updateLegacyAt(allocator, prefix, etc_dir, has_input_group);
 
     const lib_dir = std.fmt.allocPrint(allocator, "{s}{s}/lib/systemd/system", .{ destdir, prefix }) catch return;
     defer allocator.free(lib_dir);
-    updateLegacyAt(allocator, prefix, lib_dir);
+    updateLegacyAt(allocator, prefix, lib_dir, has_input_group);
 }
 
 pub fn updateLegacyAt(
     allocator: std.mem.Allocator,
     prefix: []const u8,
     base_dir: []const u8,
+    has_input_group: bool,
 ) void {
     const svc_path = std.fmt.allocPrint(allocator, "{s}/padctl.service", .{base_dir}) catch return;
     defer allocator.free(svc_path);
     if (std.fs.accessAbsolute(svc_path, .{})) {
-        const content = generateSystemServiceContent(allocator, prefix) catch return;
+        const content = generateSystemServiceContent(allocator, prefix, has_input_group) catch return;
         defer allocator.free(content);
         if (std.fs.createFileAbsolute(svc_path, .{ .truncate = true })) |f| {
             defer f.close();
@@ -346,10 +349,14 @@ pub fn installBinaries(
 pub fn installServiceFiles(allocator: std.mem.Allocator, plan: *const InstallPlan) !void {
     const service_path = try std.fmt.allocPrint(allocator, "{s}/padctl.service", .{plan.service_dir});
     defer allocator.free(service_path);
+    // Probe once: distros using uaccess/ACL (e.g. Bazzite/Fedora) have no
+    // 'input' unix group. Emitting SupplementaryGroups=input on those systems
+    // causes systemd EXIT_GROUP (216) and a restart loop (#279).
+    const has_input_group = plan_mod.hostHasInputGroup();
     // Always use the user-service template. Even on immutable-root installs,
     // the service file is placed under /etc/systemd/user/ so systemd discovers
     // it as a user unit and each user's systemd instance runs its own copy.
-    const service_content = try generateServiceContent(allocator, plan.prefix);
+    const service_content = try generateServiceContent(allocator, plan.prefix, has_input_group);
     defer allocator.free(service_content);
     {
         var f = try std.fs.createFileAbsolute(service_path, .{ .truncate = true });
@@ -380,7 +387,7 @@ pub fn installServiceFiles(allocator: std.mem.Allocator, plan: *const InstallPla
     // of effective_immutable. Pre-user-service installs on any distro
     // placed the unit under /etc/systemd/system/ or <prefix>/lib/systemd/
     // system/. The helper is a no-op when no legacy file is present.
-    updateLegacySystemService(allocator, plan.opts.destdir, plan.prefix);
+    updateLegacySystemService(allocator, plan.opts.destdir, plan.prefix, has_input_group);
 }
 
 pub fn installReconnectScript(allocator: std.mem.Allocator, plan: *const InstallPlan) !void {

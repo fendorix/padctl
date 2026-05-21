@@ -106,7 +106,7 @@ Mapping configs are validated at daemon startup. Errors are written to the journ
 journalctl -u padctl.service -n 30
 ```
 
-Note: `padctl --validate` is for device configs only.
+Mapping configs can also be validated with `padctl --validate`; the flag auto-detects device vs mapping schema by scanning for a `[device]` table.
 
 ## Configuration Sections
 
@@ -136,7 +136,9 @@ Available target types:
 | `"disabled"` | Suppress the button entirely |
 | `"macro:<name>"` | Run a named macro sequence |
 
-Available button names: `A`, `B`, `X`, `Y`, `LB`, `RB`, `LT`, `RT`, `Start`, `Select`, `LS`, `RS`, `M1`, `M2`, `M3`, `M4`, `LM`, `RM`, `C`, `Z`
+> **Note:** `BTN_*` values (e.g. `"BTN_SOUTH"`) are routed to the virtual **mouse** device, not the gamepad. To remap to a gamepad button use a friendly `ButtonId` name (`"A"`, `"Select"`, etc.) instead.
+
+Available button names: `A`, `B`, `X`, `Y`, `LB`, `RB`, `LT`, `RT`, `Start`, `Select`, `Home`, `Capture`, `LS`, `RS`, `DPadUp`, `DPadDown`, `DPadLeft`, `DPadRight`, `M1`, `M2`, `M3`, `M4`, `Paddle1`, `Paddle2`, `Paddle3`, `Paddle4`, `TouchPad`, `Mic`, `C`, `Z`, `LM`, `RM`, `O`
 
 #### Tap / hold / double-press on one button
 
@@ -193,6 +195,25 @@ smoothing   = 0.3
 ```
 
 This is useful for games that read the right stick for camera control but do not natively support gyro input. All other `[gyro]` fields (`sensitivity`, `deadzone`, `smoothing`, `curve`, `invert_x`, `invert_y`) apply in joystick mode the same way as in mouse mode.
+
+#### Blending gyro with the physical stick (`blend_stick`)
+
+By default, gyro joystick output **replaces** the physical stick value while gyro is active. Set `blend_stick = true` to **add** the gyro signal on top of the physical stick instead:
+
+```toml
+[gyro]
+mode        = "joystick"
+target      = "right_stick"
+activate    = "LS"
+sensitivity = 1.5
+deadzone    = 200
+smoothing   = 0.3
+blend_stick = true          # add gyro onto physical stick instead of replacing it
+```
+
+This lets the physical stick handle coarse movement while the gyro provides fine aim adjustment simultaneously — useful for aim-assist workflows. The combined value is clamped to the valid axis range (`-32767..32767`).
+
+> **Note:** when the physical stick is already at full deflection (±32767), the gyro contribution is clamped out entirely. `blend_stick` has no effect when `mode = "mouse"`.
 
 ### Sticks (`[stick.left]` / `[stick.right]`)
 
