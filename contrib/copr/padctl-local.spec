@@ -72,6 +72,11 @@ rm -rf ~/.cache/zig .zig-cache/ zig-out/
     --no-start
 
 # The installer generates a user service under /usr/lib/systemd/user/.
+# But it includes SupplementaryGroups=input based on whether the BUILD host has
+# the group. On Fedora, this causes exit 216/GROUP. Strip it out.
+sed -i '/^SupplementaryGroups=input$/d' %{buildroot}%{_prefix}/lib/systemd/user/padctl.service
+
+# The installer generates a user service under /usr/lib/systemd/user/.
 # Create a system-service variant for the RPM so the daemon starts at boot
 # without requiring a user session.
 # Note: Omit SupplementaryGroups=input — Fedora uses uaccess/ACL instead of
