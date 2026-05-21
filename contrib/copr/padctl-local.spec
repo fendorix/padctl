@@ -140,9 +140,19 @@ sed -i "s|%{buildroot}||g" %{buildroot}%{_prefix}/lib/udev/rules.d/61-padctl-dri
 
 %post
 %systemd_post padctl.service
+# Create sentinel file to enable xpad unbinding when service is enabled
+if systemctl is-enabled padctl.service >/dev/null 2>&1; then
+    mkdir -p /etc/padctl
+    echo "padctl service-enabled sentinel v1" > /etc/padctl/service-enabled
+    echo "prefix=/usr" >> /etc/padctl/service-enabled
+fi
 
 %preun
 %systemd_preun padctl.service
+# Remove sentinel on uninstall
+if [ "$1" -eq 0 ]; then
+    rm -f /etc/padctl/service-enabled
+fi
 
 %postun
 %systemd_postun_with_restart padctl.service
