@@ -317,6 +317,11 @@ pub const MappingConfig = struct {
     macro: ?[]const Macro = null,
     adaptive_trigger: ?AdaptiveTriggerConfig = null,
     trigger_threshold: ?u8 = null,
+    /// Number of consecutive frames a button must be pressed before the press
+    /// is recognized. 0 or null disables debouncing. A value of 1 requires 2
+    /// consecutive frames (the first frame increments the counter, the second
+    /// allows the press through).
+    debounce_frames: ?u8 = null,
 };
 
 pub const ParseResult = toml.Parsed(MappingConfig);

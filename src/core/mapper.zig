@@ -124,6 +124,11 @@ pub const Mapper = struct {
     resolved_layers: []ResolvedRemap,
     // In-controller mapping switch via chord detection. null disables the feature.
     chord_detector: ?ChordDetector = null,
+    // Per-button debounce counters. Incremented each frame the physical button
+    // is pressed; reset on release. The press is only recognized once the
+    // counter exceeds debounce_threshold.
+    debounce_counters: [BUTTON_COUNT]u8 = [_]u8{0} ** BUTTON_COUNT,
+    debounce_threshold: u8 = 0,
 
     pub fn init(config: *const MappingConfig, timer_fd: std.posix.fd_t, allocator: std.mem.Allocator) !Mapper {
         const base = if (config.remap) |m| try precomputeRemap(allocator, m) else ResolvedRemap{
@@ -170,6 +175,7 @@ pub const Mapper = struct {
             .next_token = 1,
             .resolved_base = base,
             .resolved_layers = resolved_layers,
+            .debounce_threshold = config.debounce_frames orelse 0,
         };
     }
 
@@ -201,6 +207,26 @@ pub const Mapper = struct {
         }
 
         self.state.applyDelta(delta);
+
+        // Debounce: require a button to be pressed for `debounce_threshold + 1`
+        // consecutive frames before the press is recognized. This filters out
+        // single-frame glitches from noisy buttons.
+        if (self.debounce_threshold > 0) {
+            for (0..BUTTON_COUNT) |i| {
+                const mask = @as(u64, 1) << @as(u6, @intCast(i));
+                const pressed = (self.state.buttons & mask) != 0;
+                if (pressed) {
+                    if (self.debounce_counters[i] < self.debounce_threshold) {
+                        self.debounce_counters[i] += 1;
+                        // Suppress the press for this frame.
+                        self.state.buttons &= ~mask;
+                    }
+                    // Once counter exceeds threshold, the button stays allowed.
+                } else {
+                    self.debounce_counters[i] = 0;
+                }
+            }
+        }
 
         // Synthesize LT/RT as digital buttons when trigger_threshold is configured.
         if (self.config.trigger_threshold) |threshold| {
@@ -2324,4 +2350,220 @@ test "mapper: timing boundary sweep — tap fires via .pending branch iff releas
             }
         }
     }
+}
+
+// --- Debounce tests ---
+
+test "mapper: debounce disabled by default (null debounce_frames)" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[remap]
+        \\M1 = "KEY_F13"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const m1_idx: u6 = @intCast(@intFromEnum(ButtonId.M1));
+    const m1_mask: u64 = @as(u64, 1) << m1_idx;
+
+    // Single-frame press should fire immediately with debounce disabled
+    const ev = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 1), ev.aux.len);
+    switch (ev.aux.get(0)) {
+        .key => |k| {
+            try testing.expectEqual(@as(u16, 183), k.code); // KEY_F13
+            try testing.expect(k.pressed);
+        },
+        else => return error.WrongEventType,
+    }
+}
+
+test "mapper: debounce=1 suppresses single-frame glitch" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\debounce_frames = 1
+        \\[remap]
+        \\M1 = "KEY_F13"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const m1_idx: u6 = @intCast(@intFromEnum(ButtonId.M1));
+    const m1_mask: u64 = @as(u64, 1) << m1_idx;
+
+    // Frame 1: press — suppressed by debounce
+    const ev1 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 0), ev1.aux.len);
+
+    // Frame 2: still pressed — now allowed through
+    const ev2 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 1), ev2.aux.len);
+    switch (ev2.aux.get(0)) {
+        .key => |k| {
+            try testing.expectEqual(@as(u16, 183), k.code);
+            try testing.expect(k.pressed);
+        },
+        else => return error.WrongEventType,
+    }
+}
+
+test "mapper: debounce=1 allows press after 2 consecutive frames" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\debounce_frames = 1
+        \\[remap]
+        \\M1 = "KEY_F13"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const m1_idx: u6 = @intCast(@intFromEnum(ButtonId.M1));
+    const m1_mask: u64 = @as(u64, 1) << m1_idx;
+
+    // Frame 1: press — suppressed
+    _ = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    // Frame 2: press — allowed
+    const ev2 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 1), ev2.aux.len);
+    // Frame 3: still pressed — no new edge, no new aux event
+    const ev3 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 0), ev3.aux.len);
+}
+
+test "mapper: debounce=1 release resets counter" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\debounce_frames = 1
+        \\[remap]
+        \\M1 = "KEY_F13"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const m1_idx: u6 = @intCast(@intFromEnum(ButtonId.M1));
+    const m1_mask: u64 = @as(u64, 1) << m1_idx;
+
+    // Frame 1: press — suppressed
+    _ = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    // Frame 2: release — counter resets, no key event
+    const ev2 = try m.apply(.{ .buttons = 0 }, 16, 0);
+    try testing.expectEqual(@as(usize, 0), ev2.aux.len);
+    // Frame 3: press again — must be suppressed again (counter was reset)
+    const ev3 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 0), ev3.aux.len);
+    // Frame 4: still pressed — now allowed
+    const ev4 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 1), ev4.aux.len);
+}
+
+test "mapper: debounce=1 release emits key release after allowed press" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\debounce_frames = 1
+        \\[remap]
+        \\M1 = "KEY_F13"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const m1_idx: u6 = @intCast(@intFromEnum(ButtonId.M1));
+    const m1_mask: u64 = @as(u64, 1) << m1_idx;
+
+    // Frame 1: press — suppressed
+    _ = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    // Frame 2: press — allowed (press event)
+    _ = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    // Frame 3: release — key release event
+    const ev3 = try m.apply(.{ .buttons = 0 }, 16, 0);
+    try testing.expectEqual(@as(usize, 1), ev3.aux.len);
+    switch (ev3.aux.get(0)) {
+        .key => |k| {
+            try testing.expectEqual(@as(u16, 183), k.code);
+            try testing.expect(!k.pressed);
+        },
+        else => return error.WrongEventType,
+    }
+}
+
+test "mapper: debounce=2 requires 3 consecutive frames" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\debounce_frames = 2
+        \\[remap]
+        \\M1 = "KEY_F13"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const m1_idx: u6 = @intCast(@intFromEnum(ButtonId.M1));
+    const m1_mask: u64 = @as(u64, 1) << m1_idx;
+
+    // Frame 1: press — suppressed (counter=1)
+    const ev1 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 0), ev1.aux.len);
+    // Frame 2: press — suppressed (counter=2)
+    const ev2 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 0), ev2.aux.len);
+    // Frame 3: press — allowed (counter=3 > threshold=2)
+    const ev3 = try m.apply(.{ .buttons = m1_mask }, 16, 0);
+    try testing.expectEqual(@as(usize, 1), ev3.aux.len);
+}
+
+test "mapper: debounce only affects remapped buttons, passthrough unaffected" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\debounce_frames = 1
+        \\[remap]
+        \\M1 = "KEY_F13"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const a_idx: u6 = @intCast(@intFromEnum(ButtonId.A));
+    const a_mask: u64 = @as(u64, 1) << a_idx;
+
+    // A is not remapped, so it should pass through immediately even with debounce on
+    const ev = try m.apply(.{ .buttons = a_mask }, 16, 0);
+    try testing.expect((ev.gamepad.buttons & a_mask) != 0);
+    try testing.expectEqual(@as(usize, 0), ev.aux.len);
+}
+
+test "mapper: debounce with gamepad_button remap" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\debounce_frames = 1
+        \\[remap]
+        \\A = "B"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const a_idx: u6 = @intCast(@intFromEnum(ButtonId.A));
+    const a_mask: u64 = @as(u64, 1) << a_idx;
+    const b_idx: u6 = @intCast(@intFromEnum(ButtonId.B));
+    const b_mask: u64 = @as(u64, 1) << b_idx;
+
+    // Frame 1: A pressed — debounce suppresses, no B injected
+    const ev1 = try m.apply(.{ .buttons = a_mask }, 16, 0);
+    try testing.expectEqual(@as(u64, 0), ev1.gamepad.buttons & b_mask);
+
+    // Frame 2: A still pressed — debounce allows, B injected
+    const ev2 = try m.apply(.{ .buttons = a_mask }, 16, 0);
+    try testing.expect((ev2.gamepad.buttons & b_mask) != 0);
 }

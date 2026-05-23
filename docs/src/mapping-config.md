@@ -13,6 +13,7 @@ trigger_threshold = 100
 |-------|------|---------|-------------|
 | `name` | string | — | Mapping profile name. Used by `padctl switch <name>` and `default_mapping` in user config to identify this profile. |
 | `trigger_threshold` | integer (0–255) | null | Threshold for synthesizing digital `LT` / `RT` button events from the analog trigger axes. **Top-level only** — placing this inside `[[layer]]` is silently ignored. See below. |
+| `debounce_frames` | integer (0–255) | null | Number of consecutive frames a button must be pressed before the press is recognized. `0` or omitted disables debouncing. A value of `1` requires 2 consecutive frames (filters single-frame glitches). Useful for noisy extra buttons that occasionally emit ghost presses. See below. |
 | `chord_index` | integer (0–255) | null | Selector index used by the in-controller `[chord_switch]` quick-switch. The value is matched against the position of `[chord_switch].selectors`: `chord_index = i+1` activates when `selectors[i]` is pressed. Set `chord_index = 0` (or omit) to leave a mapping unselectable via chord. See [Diagnostic Logging — Chord switch](diagnostic-logging.md#chord-switch-issue-183) for the full setup. |
 
 ## Validation behaviour
@@ -54,6 +55,36 @@ Use `padctl dump enable` to observe raw LT / RT axis readings and dial in the th
 **Jitter:** If the axis hovers around the threshold and produces rapid press/release bursts, raise the threshold by 10–20.
 
 Without `trigger_threshold`, `LT` / `RT` emit analog axis events only and do not participate in `[remap]` or layer trigger matching.
+
+<a id="debounce_frames"></a>
+### debounce_frames — filter single-frame ghost presses
+
+Some controllers (especially extra buttons like `LM`, `RM`, `M1`–`M4`, and paddles) occasionally emit single-frame press glitches even when the button is not physically touched. These ghost inputs are particularly annoying when the button is remapped to a keyboard key.
+
+```toml
+debounce_frames = 1   # require 2 consecutive frames before accepting a press
+```
+
+**How it works:**
+
+- A counter tracks how many consecutive frames each button has been pressed.
+- The press is only recognized once the counter exceeds `debounce_frames`.
+- On release, the counter resets immediately.
+
+| Value | Behaviour |
+|-------|-----------|
+| `0` or omitted | No debouncing (default). Every press is recognized immediately. |
+| `1` | Requires **2 consecutive frames** — filters single-frame glitches. Recommended starting point for noisy buttons. |
+| `2` | Requires **3 consecutive frames** — stronger filtering, slightly more latency. |
+
+**When to use:**
+
+- Extra buttons (`LM`, `RM`, paddles) that occasionally fire without being touched.
+- Any remapped button that produces phantom keyboard/mouse inputs in desktop mode or games.
+
+**Trade-off:** Higher values add latency (one extra frame per increment). At a typical 4 ms USB poll interval, `debounce_frames = 1` adds ~4 ms of latency — imperceptible for most use cases.
+
+**Note:** `debounce_frames` only affects buttons that are remapped (in `[remap]` or layer remaps). Passthrough buttons that are not remapped are not debounced, so normal gamepad buttons continue to respond immediately.
 
 ## `[remap]`
 
