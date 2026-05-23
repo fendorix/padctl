@@ -108,10 +108,10 @@ O      = "BTN_TRIGGER_HAPPY9"
 # (C=16, Z=17, LM=22, RM=23). The BTN_TRIGGER_HAPPY* targets are arbitrary
 # but distinct from the M1–M4 block above; renumber if they collide with
 # mappings you use.
-# C      = "BTN_TRIGGER_HAPPY1"
-# Z      = "BTN_TRIGGER_HAPPY2"
-# LM     = "BTN_TRIGGER_HAPPY3"
-# RM     = "BTN_TRIGGER_HAPPY4"
+C      = "BTN_TRIGGER_HAPPY1"
+Z      = "BTN_TRIGGER_HAPPY2"
+LM     = "BTN_TRIGGER_HAPPY3"
+RM     = "BTN_TRIGGER_HAPPY4"
 
 [output.dpad]
 type = "hat"
