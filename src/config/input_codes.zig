@@ -194,6 +194,8 @@ pub const key_table = [_]CodeEntry{
     .{ .name = "KEY_I", .code = c.KEY_I },
     .{ .name = "KEY_O", .code = c.KEY_O },
     .{ .name = "KEY_P", .code = c.KEY_P },
+    .{ .name = "KEY_LEFTBRACE", .code = c.KEY_LEFTBRACE },
+    .{ .name = "KEY_RIGHTBRACE", .code = c.KEY_RIGHTBRACE },
     .{ .name = "KEY_A", .code = c.KEY_A },
     .{ .name = "KEY_S", .code = c.KEY_S },
     .{ .name = "KEY_D", .code = c.KEY_D },
