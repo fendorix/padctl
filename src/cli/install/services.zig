@@ -9,14 +9,18 @@ const runCmdWarn = plan_mod.runCmdWarn;
 const planSystemctlUser = plan_mod.planSystemctlUser;
 const atomicInstallBinary = plan_mod.atomicInstallBinary;
 
-pub fn generateServiceContent(allocator: std.mem.Allocator, prefix: []const u8, has_input_group: bool) ![]const u8 {
+/// Generate the systemd --user unit. SupplementaryGroups= is intentionally
+/// NOT emitted: a user-scope service manager runs unprivileged (no CAP_SETGID)
+/// and cannot apply it, so the directive aborts startup with status=216/GROUP
+/// regardless of whether the host has an 'input' group (issues #287, #288).
+/// Device-node access for the daemon comes from udev GROUP="input" MODE="0660"
+/// rules plus desktop uaccess ACLs, not from the unit.
+pub fn generateServiceContent(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
     const exec_start = if (std.mem.eql(u8, prefix, "/usr"))
         try std.fmt.allocPrint(allocator, "{s}/bin/padctl", .{prefix})
     else
         try std.fmt.allocPrint(allocator, "{s}/bin/padctl --config-dir {s}/share/padctl/devices", .{ prefix, prefix });
     defer allocator.free(exec_start);
-
-    const group_line: []const u8 = if (has_input_group) "SupplementaryGroups=input\n" else "";
 
     return std.fmt.allocPrint(allocator,
         \\[Unit]
@@ -26,7 +30,7 @@ pub fn generateServiceContent(allocator: std.mem.Allocator, prefix: []const u8, 
         \\[Service]
         \\Type=simple
         \\ExecStart={s}
-        \\{s}Restart=on-failure
+        \\Restart=on-failure
         \\RestartSec=3
         \\# Canonical state/log dir: $XDG_STATE_HOME/padctl on user services,
         \\# /var/lib/padctl on system services. systemd pre-creates it with
@@ -38,7 +42,7 @@ pub fn generateServiceContent(allocator: std.mem.Allocator, prefix: []const u8, 
         \\[Install]
         \\WantedBy=default.target
         \\
-    , .{ exec_start, group_line });
+    , .{exec_start});
 }
 
 pub const immutable_dropin_content =
@@ -80,13 +84,49 @@ pub fn generateReconnectScript(allocator: std.mem.Allocator, prefix: []const u8)
         \\sleep 1
         \\
         \\# Re-apply mapping after hotplug (device reconnects in passthrough mode).
-        \\# Apply the first mapping found (sorted for deterministic selection).
+        \\# Prefer config.toml's default_mapping; fall back to explicit mapping files.
         \\# /etc/padctl/mappings is the FHS sysconfdir — fixed at /etc regardless
         \\# of --prefix. systemConfigDir() in src/config/paths.zig is the SSOT.
         \\sleep 2
+        \\padctl_bin="{s}/bin/padctl"
+        \\
+        \\run_padctl_switch() {{
+        \\    local sock="$1"
+        \\    shift
+        \\
+        \\    if [[ "$sock" == /run/user/*/padctl.sock ]]; then
+        \\        local uid passwd user home
+        \\        uid="$(stat -c %u "$sock" 2>/dev/null)" || return 1
+        \\        passwd="$(getent passwd "$uid")" || return 1
+        \\        IFS=: read -r user _ _ _ _ home _ <<< "$passwd"
+        \\        [ -n "$user" ] && [ -n "$home" ] || return 1
+        \\        command -v runuser >/dev/null 2>&1 || return 1
+        \\        runuser -u "$user" -- env -u XDG_CONFIG_HOME HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/$uid" "$padctl_bin" switch "$@" --socket "$sock"
+        \\        return $?
+        \\    fi
+        \\
+        \\    "$padctl_bin" switch "$@" --socket "$sock"
+        \\}}
+        \\
+        \\sockets=()
+        \\for sock in /run/user/*/padctl.sock; do
+        \\    [ -S "$sock" ] && sockets+=("$sock")
+        \\done
+        \\[ -S /run/padctl/padctl.sock ] && sockets+=("/run/padctl/padctl.sock")
+        \\[ ${{#sockets[@]}} -eq 0 ] && exit 0
+        \\
+        \\fallback_mapping=""
         \\for f in $(ls /etc/padctl/mappings/*.toml 2>/dev/null | sort); do
         \\    [ -f "$f" ] || continue
-        \\    {s}/bin/padctl switch "$f" --socket /run/padctl/padctl.sock 2>/dev/null && break
+        \\    fallback_mapping="$f"
+        \\    break
+        \\done
+        \\
+        \\applied=0
+        \\for sock in "${{sockets[@]}}"; do
+        \\    run_padctl_switch "$sock" 2>/dev/null && applied=1 && continue
+        \\    [ -n "$fallback_mapping" ] || continue
+        \\    run_padctl_switch "$sock" "$fallback_mapping" 2>/dev/null && applied=1
         \\done
         \\
     , .{prefix});
@@ -349,14 +389,10 @@ pub fn installBinaries(
 pub fn installServiceFiles(allocator: std.mem.Allocator, plan: *const InstallPlan) !void {
     const service_path = try std.fmt.allocPrint(allocator, "{s}/padctl.service", .{plan.service_dir});
     defer allocator.free(service_path);
-    // Probe once: distros using uaccess/ACL (e.g. Bazzite/Fedora) have no
-    // 'input' unix group. Emitting SupplementaryGroups=input on those systems
-    // causes systemd EXIT_GROUP (216) and a restart loop (#279).
-    const has_input_group = plan_mod.hostHasInputGroup();
     // Always use the user-service template. Even on immutable-root installs,
     // the service file is placed under /etc/systemd/user/ so systemd discovers
     // it as a user unit and each user's systemd instance runs its own copy.
-    const service_content = try generateServiceContent(allocator, plan.prefix, has_input_group);
+    const service_content = try generateServiceContent(allocator, plan.prefix);
     defer allocator.free(service_content);
     {
         var f = try std.fs.createFileAbsolute(service_path, .{ .truncate = true });
@@ -387,7 +423,9 @@ pub fn installServiceFiles(allocator: std.mem.Allocator, plan: *const InstallPla
     // of effective_immutable. Pre-user-service installs on any distro
     // placed the unit under /etc/systemd/system/ or <prefix>/lib/systemd/
     // system/. The helper is a no-op when no legacy file is present.
-    updateLegacySystemService(allocator, plan.opts.destdir, plan.prefix, has_input_group);
+    // SupplementaryGroups= remains valid on a system-scope unit (PID 1 has
+    // CAP_SETGID), so the legacy path keeps the conditional probe.
+    updateLegacySystemService(allocator, plan.opts.destdir, plan.prefix, plan_mod.hostHasInputGroup());
 }
 
 pub fn installReconnectScript(allocator: std.mem.Allocator, plan: *const InstallPlan) !void {

@@ -13,18 +13,18 @@ Without a mapping config, padctl passes all inputs through unchanged as a standa
 
 ### Create a mapping
 
-Copy the example and edit it:
+Use the interactive creator:
 
 ```sh
 mkdir -p ~/.config/padctl/mappings/
-cp /usr/share/padctl/config/example-mapping.toml ~/.config/padctl/mappings/my-config.toml
-$EDITOR ~/.config/padctl/mappings/my-config.toml
+padctl config init --preset xbox-360
 ```
 
-Or use the interactive creator:
+Or, from a source checkout, copy the repository example and edit it:
 
 ```sh
-padctl config init
+cp config/example-mapping.toml ~/.config/padctl/mappings/my-config.toml
+$EDITOR ~/.config/padctl/mappings/my-config.toml
 ```
 
 ### XDG Search Paths
@@ -103,7 +103,7 @@ padctl --mapping ~/.config/padctl/mappings/my-config.toml
 Mapping configs are validated at daemon startup. Errors are written to the journal:
 
 ```sh
-journalctl -u padctl.service -n 30
+journalctl --user -u padctl.service -n 30
 ```
 
 Mapping configs can also be validated with `padctl --validate`; the flag auto-detects device vs mapping schema by scanning for a `[device]` table.
@@ -194,7 +194,32 @@ sensitivity = 1.5
 smoothing   = 0.3
 ```
 
-This is useful for games that read the right stick for camera control but do not natively support gyro input. All other `[gyro]` fields (`sensitivity`, `deadzone`, `smoothing`, `curve`, `invert_x`, `invert_y`) apply in joystick mode the same way as in mouse mode.
+This is useful for games that read the right stick for camera control but do not natively support gyro input. In the default `response = "rate"` mode, the usual gyro fields (`sensitivity`, `deadzone`, `smoothing`, `curve`, `invert_x`, `invert_y`) apply in joystick mode the same way as in mouse mode.
+
+For racing games, `response = "tilt"` maps controller tilt to an absolute stick
+position instead of treating gyro motion like stick velocity. `degrees_full`
+controls how far the controller must be tilted for full stick deflection, and
+`axis_x` / `axis_y` choose which motion axis drives each virtual stick axis:
+
+```toml
+[gyro]
+mode = "joystick"
+response = "tilt"
+target = "left_stick"
+axis_x = "roll"          # steer by rolling the controller left/right
+axis_y = "none"          # leave the Y stick axis unchanged
+degrees_full = 35.0      # +/-35 degrees maps to full stick deflection
+smoothing = 0.2
+```
+
+`response = "tilt"` uses the accelerometer to estimate `roll` and `pitch`, so
+it gives a stable absolute stick position without gyro integration drift. `yaw`
+does not have an absolute tilt estimate and resolves to neutral in tilt mode.
+When `response = "tilt"`, the default X source is `roll`; in the default
+`response = "rate"` mode, X still uses `yaw`. If a device has not reported a
+non-zero accelerometer vector yet, tilt mode leaves the physical stick axes
+unchanged for that frame. In tilt mode, `deadzone` is applied after converting
+tilt to virtual stick output rather than to raw gyro units.
 
 #### Blending gyro with the physical stick (`blend_stick`)
 
@@ -247,10 +272,11 @@ Default is `"gamepad"`. Set to `"arrows"` to make the d-pad behave as arrow keys
 
 Layers are the most powerful feature. A layer is a context-sensitive override: while active, its remap/gyro/stick/dpad settings replace the base config.
 
-Two activation modes:
+Three activation modes:
 
 - `"hold"` — active while the trigger button is held
 - `"toggle"` — press once to enter, press again to exit
+- `"hold_toggle"` — short press fires `tap`; holding past `hold_timeout` toggles the layer on or off
 
 The `tap` + `hold_timeout` combination lets a button do double duty: if released before `hold_timeout` ms, it fires `tap` instead of activating the layer.
 
@@ -305,6 +331,26 @@ A = "KEY_F1"
 B = "KEY_F2"
 X = "KEY_F3"
 Y = "KEY_F4"
+```
+
+Hold-to-toggle example — hold LM to keep a racing layer enabled, hold it again
+to disable it. A short press still emits `tap`:
+
+```toml
+[[layer]]
+name         = "race"
+trigger      = "LM"
+activation   = "hold_toggle"
+hold_timeout = 300
+tap          = "LM"
+
+[layer.gyro]
+mode = "joystick"
+response = "tilt"
+target = "left_stick"
+axis_x = "roll"
+axis_y = "none"
+degrees_full = 35.0
 ```
 
 Layers are evaluated in declaration order. Only one layer is active at a time.
@@ -418,7 +464,7 @@ See [Mapping Config Reference — chord_switch](mapping-config.md#chord_switch--
 
 ## Full Example
 
-A copy-paste-ready example covering every major feature is included in the repository at [`examples/mappings/comprehensive.toml`](https://github.com/BANANASJIM/padctl/blob/main/examples/mappings/comprehensive.toml). It covers base remaps, two layers (hold + toggle), macros, stick modes, and gyro.
+A copy-paste-ready example covering every major feature is included in the repository at [`examples/mappings/comprehensive.toml`](https://github.com/BANANASJIM/padctl/blob/main/examples/mappings/comprehensive.toml). It covers base remaps, hold/toggle/hold-toggle layers, macros, stick modes, and gyro.
 
 ## Reference
 

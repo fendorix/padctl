@@ -11,6 +11,86 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Build and publish the canonical padctl build image (ADR-019) to GHCR.
+  # The image is tagged with the Zig version read from .zigversion. On a
+  # push event the job builds and pushes only when that version tag is not
+  # already in the registry (manifest-inspect cache check); on a fork
+  # pull_request it cannot push, so it builds locally for verification.
+  # This job is currently additive — no other job consumes the image yet.
+  build-image:
+    name: build-image
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve image reference
+        id: img
+        run: |
+          set -euo pipefail
+          ver="$(head -n1 .zigversion | tr -d '[:space:]')"
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${owner}/padctl-build:${ver}" >> "$GITHUB_OUTPUT"
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+      - name: Look up Zig SHA256
+        id: sha
+        run: |
+          set -euo pipefail
+          amd64="$(scripts/padctl-docker --print-sha amd64)"
+          test -n "$amd64"
+          echo "amd64=${amd64}" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check whether image tag already exists
+        id: exists
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "${{ steps.img.outputs.ref }}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and push canonical image
+        if: steps.exists.outputs.found == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.img.outputs.ref }}
+          build-args: |
+            ZIG_VERSION=${{ steps.img.outputs.version }}
+            ZIG_SHA256=${{ steps.sha.outputs.amd64 }}
+
+  # Resolve the canonical build image reference from .zigversion (ADR-019).
+  # GitHub Actions cannot read a file inside a `container:` expression, so the
+  # tag is computed once here and consumed via needs.image-ref.outputs.ref.
+  # Mirrors the build-image job's "Resolve image reference" step — .zigversion
+  # stays the single source of truth for the Zig version.
+  image-ref:
+    name: image-ref
+    runs-on: ubuntu-22.04
+    outputs:
+      ref: ${{ steps.img.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve image reference
+        id: img
+        run: |
+          set -euo pipefail
+          ver="$(head -n1 .zigversion | tr -d '[:space:]')"
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${owner}/padctl-build:${ver}" >> "$GITHUB_OUTPUT"
+
   # Build the Lean formal-spec oracle once and publish it as an artifact.
   # The interactive-Lean-oracle DRT suite in src/test/properties/drt_props.zig
   # only runs when formal/lean/.lake/build/bin/oracle exists; without this job
@@ -33,6 +113,11 @@ jobs:
         run: lake build oracle
       - name: Verify oracle binary exists
         run: test -x formal/lean/.lake/build/bin/oracle
+      - name: Verify generated Lean vectors are current
+        working-directory: formal/lean
+        run: |
+          .lake/build/bin/oracle > /tmp/padctl-lean-test-vectors.csv
+          diff -u test_vectors.csv /tmp/padctl-lean-test-vectors.csv
       - name: Upload oracle artifact
         uses: actions/upload-artifact@v4
         with:
@@ -44,7 +129,15 @@ jobs:
   check-matrix:
     name: check / ${{ matrix.os }} / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    needs: [lean-oracle]
+    needs: [lean-oracle, image-ref, build-image]
+    # Run inside the canonical build image (ADR-019): Zig + libusb + kernel
+    # headers are baked in, so no setup-zig step or apt install is needed.
+    container: ${{ needs.image-ref.outputs.ref }}
+    # debian:bookworm-slim links /bin/sh to dash; force bash so run: steps
+    # keep their `set -o pipefail` and `| tee` pipelines.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -64,13 +157,6 @@ jobs:
       PADCTL_TEST_REQUIRE_LEAN: "1"
     steps:
       - uses: actions/checkout@v4
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-      - name: Install system dependencies
-        if: matrix.name != 'libusb-false'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev
       - name: Download Lean oracle artifact
         uses: actions/download-artifact@v4
         with:
@@ -115,14 +201,18 @@ jobs:
   tsan:
     name: tsan / ubuntu-22.04
     runs-on: ubuntu-22.04
+    needs: [image-ref, build-image]
+    # Run inside the canonical build image (ADR-019): Zig + libusb are baked
+    # in. gdb is only needed by the failure-only diagnostics step below and is
+    # installed there to keep the happy path free of an apt install.
+    container: ${{ needs.image-ref.outputs.ref }}
+    # debian:bookworm-slim links /bin/sh to dash; force bash so run: steps
+    # keep their `set -o pipefail`, `| tee` and `bash -lc` usage.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev gdb
       - name: Run TSAN tests
         run: |
           set -o pipefail
@@ -133,6 +223,7 @@ jobs:
         if: failure()
         run: |
           set -euo pipefail
+          apt-get update && apt-get install -y --no-install-recommends gdb
           echo "==== TSAN summary from build log ===="
           grep -nE "ThreadSanitizer|data race|thread leak|SUMMARY|signal [0-9]+|terminated with signal|error: while executing test" tsan-build.log || true
           FAILED_CMD="$(grep -E '^\.?/?\.zig-cache/o/.+/test --cache-dir=' tsan-build.log | tail -n 1 || true)"
@@ -163,61 +254,57 @@ jobs:
             tsan-gdb.log
             tsan*
 
+  # Compile the musl-static padctl binary once inside the canonical build
+  # image (ADR-019) and publish it as an artifact. The distro-check matrix
+  # then `docker run`s this binary on pristine debian:12 / fedora:41 images,
+  # which stay free of any padctl toolchain so the smoke test reflects a real
+  # end-user environment.
+  distro-musl-build:
+    name: distro-musl-build
+    runs-on: ubuntu-22.04
+    needs: [image-ref, build-image]
+    container: ${{ needs.image-ref.outputs.ref }}
+    # debian:bookworm-slim links /bin/sh to dash; force bash for run: steps.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build musl-static padctl
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dlibusb=false
+      - name: Upload musl binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: distro-musl-bin
+          path: zig-out/bin/padctl
+          if-no-files-found: error
+          retention-days: 1
+
   distro-check:
     name: distro-check / ${{ matrix.name }}
     runs-on: ubuntu-22.04
+    # The musl-static binary is built once in the canonical image (ADR-019);
+    # this job only `docker run`s it on pristine distros, so it cannot itself
+    # be a `container:` job and instead depends on the distro-musl-build
+    # artifact.
+    needs: [distro-musl-build]
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: debian-12
             image: debian:12
-            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl xz-utils gcc g++ make pkg-config linux-libc-dev
           - name: fedora-41
             image: fedora:41
-            setup: dnf install -y ca-certificates curl xz gcc gcc-c++ make pkgconf-pkg-config kernel-headers glibc-headers glibc-devel
     steps:
       - uses: actions/checkout@v4
-      - name: Install Zig (host)
-        uses: mlugg/setup-zig@v2
+      - name: Download musl binary
+        uses: actions/download-artifact@v4
         with:
-          version: 0.15.2
-      - name: Stage host Zig for container
-        run: |
-          set -e
-          HOST_ZIG=$(which zig)
-          HOST_ZIG_DIR=$(dirname "$HOST_ZIG")
-          cp -a "$HOST_ZIG_DIR" /tmp/zig-host
-          /tmp/zig-host/zig version
-      - name: Run check-all in container
-        env:
-          DISTRO_IMAGE: ${{ matrix.image }}
-          DISTRO_SETUP: ${{ matrix.setup }}
-        run: |
-          set -euo pipefail
-          docker run --rm \
-            -v "$PWD:/work" \
-            -v /tmp/zig-host:/opt/zig:ro \
-            -w /work \
-            "$DISTRO_IMAGE" \
-            /bin/sh -lc "
-              set -eu
-              ${DISTRO_SETUP}
-              timeout 600 /opt/zig/zig build -Dlibusb=false test --summary all
-              timeout 600 /opt/zig/zig build -Dlibusb=false test-safe --summary all
-              timeout 600 /opt/zig/zig build -Dlibusb=false check-fmt
-            " 2>&1 | tee distro-check.log
-      # The container above runs as root (apt-get/dnf require it), so any
-      # .zig-cache / zig-out files it writes are root-owned on the host.
-      # The subsequent host build step and the setup-zig post-job cache-save
-      # trim both run as the unprivileged `runner` user; root-owned files make
-      # the post-job `unlink` trim fail with EACCES once the cache exceeds the
-      # 2 GiB limit. Reclaim ownership so runner-side steps can manage them.
-      - name: Reclaim container-written cache ownership
-        if: always()
-        run: sudo chown -R "$(id -u):$(id -g)" .zig-cache zig-out 2>/dev/null || true
-      - name: Build musl binary (host)
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dlibusb=false
+          name: distro-musl-bin
+          path: zig-out/bin
+      - name: Restore binary executable bit
+        run: chmod +x zig-out/bin/padctl
       - name: Smoke-test musl binary in container
         # Verifies the musl-static binary actually executes on minimal debian/fedora — catches packaging/loader regressions that zig build test (host-glibc) misses
         env:
@@ -235,3 +322,32 @@ jobs:
               padctl scan --help > /dev/null
               padctl --validate /devices/sony/dualsense.toml
             "
+
+  # Drift-guard (ADR-019): the migrated workflows must build/test only inside
+  # the canonical image. Fail if `mlugg/setup-zig` or a `zig-version:` input is
+  # reintroduced into any of them. coverage.yml (kcov) and lean.yml are
+  # intentionally not migrated and are deliberately excluded from this check.
+  drift-guard:
+    name: drift-guard
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: No setup-zig in migrated workflows
+        run: |
+          set -euo pipefail
+          migrated="ci.yml e2e.yml validate.yml docs.yml release.yml install-flow.yml"
+          status=0
+          for wf in $migrated; do
+            path=".github/workflows/$wf"
+            # Strip comment lines so prose mentioning the action does not trip
+            # the guard; match the action ref and the setup-zig input key.
+            if grep -nE '^[^#]*(mlugg/setup-zig|zig-version:)' "$path"; then
+              echo "ERROR: $path reintroduced a hardcoded Zig toolchain (ADR-019)." >&2
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "Migrated workflows must run inside ghcr.io/.../padctl-build (.zigversion)." >&2
+            exit 1
+          fi
+          echo "drift-guard: all migrated workflows use the canonical image."

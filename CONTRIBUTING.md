@@ -8,7 +8,7 @@ No source code changes needed — no test files, no registration, no build syste
 1. **Capture**: Run `padctl-capture` against the target device to produce a TOML skeleton.
 
    ```
-   sudo ./zig-out/bin/padctl-capture /dev/hidraw0 > devices/<vendor>/<model>.toml
+   sudo ./zig-out/bin/padctl-capture --device /dev/hidraw0 --duration 30 --output devices/<vendor>/<model>.toml
    ```
 
 2. **Complete**: Fill in field names, button names, transform chains, and the `[output]` section.
@@ -83,7 +83,11 @@ To enable repository git hooks locally:
 git config core.hooksPath hooks
 ```
 
-With hooks enabled, `pre-push` runs `zig build test-tsan` before push.
+With hooks enabled, `pre-push` runs `zig build test-tsan` before push. On
+systems whose libc startup objects trigger Zig's known `.sframe` linker issue,
+the hook runs `test-tsan` in the canonical Docker build image instead, using
+`PADCTL_DOCKER_NETWORK=host`. Docker build/test commands run as your UID/GID so
+generated cache files remain writable.
 
 ### Code Style
 

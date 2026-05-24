@@ -125,11 +125,15 @@ invert_y = true
 |-------|------|---------|-------------|
 | `mode` | string | `"off"` | `"off"`, `"mouse"`, or `"joystick"`. In `"joystick"` mode the processed gyro signal is routed to a virtual stick axis instead of mouse `REL_X/Y` events. |
 | `target` | string | `"right_stick"` | `"right_stick"` or `"left_stick"`. Selects which stick axis receives the gyro output. Only used when `mode = "joystick"`. |
+| `response` | string | `"rate"` | `"rate"` keeps the existing gyro-rate behavior. `"tilt"` maps controller tilt to an absolute virtual stick position and is valid only with `mode = "joystick"`. |
+| `axis_x` | string | `"yaw"` / `"roll"` | Source for virtual stick X: `"yaw"`, `"pitch"`, `"roll"`, or `"none"`. Defaults to `"yaw"` in `"rate"` response and `"roll"` in `"tilt"` response. In `"tilt"` response, `roll` and `pitch` are estimated from accelerometer data; `yaw` resolves to neutral. |
+| `axis_y` | string | `"pitch"` | Source for virtual stick Y: `"yaw"`, `"pitch"`, `"roll"`, or `"none"`. |
+| `degrees_full` | float | `35.0` | In `"tilt"` response, the absolute tilt angle that maps to full stick deflection. Must be greater than `0` and no more than `180`. |
 | `activate` | string | — | Gate button: bare name (`"LS"`) or `hold_<BTN>` form (`"hold_RB"`) — both are equivalent. For analog triggers (`LT`/`RT`), also set `trigger_threshold`. Omit for always-active. |
 | `sensitivity` | float | — | Overall sensitivity multiplier |
 | `sensitivity_x` | float | — | X-axis sensitivity override |
 | `sensitivity_y` | float | — | Y-axis sensitivity override |
-| `deadzone` | integer | — | Raw gyro deadzone threshold |
+| `deadzone` | integer | — | Raw gyro deadzone threshold in `"rate"` response. In `"tilt"` response this is an output stick deadzone after angle conversion. |
 | `smoothing` | float | — | Smoothing factor (0–1) |
 | `curve` | float | — | Acceleration curve exponent |
 | `max_val` | float | — | Maximum output value cap |
@@ -192,8 +196,8 @@ hold_timeout = 200
 |-------|------|----------|-------------|
 | `name` | string | yes | Unique layer identifier |
 | `trigger` | string | yes | Button name that activates this layer |
-| `activation` | string | no | `"hold"` (default) or `"toggle"` |
-| `tap` | string | no | Button/key emitted on short press (when using hold activation). May be a `ButtonId`, `KEY_*`, `mouse_*`, or `disabled`. **Cannot be `macro:<name>`** — the layer tap dispatch path does not run macros, so `tap = "macro:foo"` is rejected at validate time (`error.LayerTapCannotBeMacro`). Use `macro:<name>` from `[remap]` / `[layer.remap]` instead. |
+| `activation` | string | no | `"hold"` (default), `"toggle"`, or `"hold_toggle"`. `hold_toggle` starts like `hold`, but holding past `hold_timeout` toggles the layer sticky on/off instead of making it momentary. |
+| `tap` | string | no | Button/key emitted on short press (when using `hold` or `hold_toggle` activation). May be a `ButtonId`, `KEY_*`, `mouse_*`, or `disabled`. **Cannot be `macro:<name>`** — the layer tap dispatch path does not run macros, so `tap = "macro:foo"` is rejected at validate time (`error.LayerTapCannotBeMacro`). Use `macro:<name>` from `[remap]` / `[layer.remap]` instead. |
 | `hold_timeout` | integer | no | Hold detection threshold in ms (1–5000); default 200 |
 
 ### `[layer.remap]`

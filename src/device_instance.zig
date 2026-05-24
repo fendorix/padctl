@@ -99,6 +99,8 @@ pub const Owner = union(enum) {
 /// node — otherwise `HidrawDevice.discover` would retry for ~7s and fail in
 /// CI before the routing switch is reached. The slice is consumed (stored in
 /// `DeviceInstance.devices`) and freed by `deinit`; caller must not free it.
+/// If `init` returns an error, no instance exists and the caller still owns
+/// the override slice and any backing mock/device resources.
 pub const InitOptions = struct {
     test_primary_uhid_fd: ?posix.fd_t = null,
     test_imu_uhid_fd: ?posix.fd_t = null,
@@ -217,6 +219,7 @@ pub const DeviceInstance = struct {
                 if (!match) continue;
                 init_seq.runInitSequence(allocator, dev, init_cfg) catch |err| {
                     std.log.debug("init on interface {d}: {}", .{ iface.id, err });
+                    return err;
                 };
             }
         }
@@ -498,9 +501,14 @@ pub const DeviceInstance = struct {
             // Apply pending mapping before processing any fds
             if (@atomicLoad(?*MappingConfig, &self.pending_mapping, .acquire)) |new| {
                 const old_mcfg: ?*const MappingConfig = if (self.mapper) |*m| m.config else self.mapping_cfg;
-                if (Mapper.init(new, self.loop.macro_timer_fd, self.allocator)) |nm| {
-                    if (self.mapper) |*m| m.deinit();
-                    self.mapper = nm;
+                if (Mapper.init(new, self.loop.macro_timer_fd, self.allocator)) |created| {
+                    var new_mapper = created;
+                    if (self.mapper) |*old| {
+                        self.releaseMapperAux(old);
+                        old.deinit();
+                    }
+                    new_mapper.seedInputState(self.loop.gamepad_state);
+                    self.mapper = new_mapper;
                     self.mapping_cfg = new;
                 } else |err| {
                     std.log.err("mapping hot-swap failed: {}", .{err});
@@ -627,6 +635,16 @@ pub const DeviceInstance = struct {
         @atomicStore(?*MappingConfig, &self.pending_mapping, new, .release);
         self.loop.stop();
     }
+
+    pub fn releaseMapperAux(self: *DeviceInstance, mapper: *Mapper) void {
+        const releases = mapper.releaseHeldAux();
+        if (releases.len == 0) return;
+        if (self.aux_dev) |*aux| {
+            aux.emitAux(releases.slice()) catch |err| {
+                std.log.warn("aux release during mapping swap failed: {}", .{err});
+            };
+        }
+    }
 };
 
 const null_output_vtable = OutputDevice.VTable{
@@ -715,6 +733,77 @@ const minimal_toml =
     \\[report.fields]
     \\left_x = { offset = 1, type = "i16le" }
 ;
+
+const init_toml =
+    \\[device]
+    \\name = "InitDevice"
+    \\vid = 1
+    \\pid = 2
+    \\[[device.interface]]
+    \\id = 0
+    \\class = "hid"
+    \\[device.init]
+    \\interface = 0
+    \\commands = ["0101"]
+    \\[[report]]
+    \\name = "r"
+    \\interface = 0
+    \\size = 1
+    \\[report.match]
+    \\offset = 0
+    \\expect = [0x01]
+;
+
+const FailWriteDeviceIO = struct {
+    pub fn deviceIO(self: *FailWriteDeviceIO) DeviceIO {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = DeviceIO.VTable{
+        .read = read,
+        .write = write,
+        .feature_report = featureReport,
+        .pollfd = pollfd,
+        .close = close,
+    };
+
+    fn read(_: *anyopaque, _: []u8) DeviceIO.ReadError!usize {
+        return DeviceIO.ReadError.Again;
+    }
+
+    fn write(_: *anyopaque, _: []const u8) DeviceIO.WriteError!void {
+        return DeviceIO.WriteError.Io;
+    }
+
+    fn featureReport(_: *anyopaque, _: []const u8) DeviceIO.WriteError!void {
+        return DeviceIO.WriteError.Io;
+    }
+
+    fn pollfd(_: *anyopaque) posix.pollfd {
+        return .{ .fd = -1, .events = 0, .revents = 0 };
+    }
+
+    fn close(_: *anyopaque) void {}
+};
+
+test "DeviceInstance.init propagates init write errors" {
+    const allocator = testing.allocator;
+
+    const parsed = try device_mod.parseString(allocator, init_toml);
+    defer parsed.deinit();
+
+    var failing = FailWriteDeviceIO{};
+    const devices = try allocator.alloc(DeviceIO, 1);
+    defer allocator.free(devices);
+    devices[0] = failing.deviceIO();
+
+    var uniq_counter: u16 = 1;
+    const result = DeviceInstance.init(allocator, &parsed.value, null, null, &uniq_counter, .{
+        .test_devices_override = devices,
+    });
+
+    try testing.expectError(DeviceIO.WriteError.Io, result);
+}
 
 test "DeviceInstance: stop() causes run() to exit" {
     const allocator = testing.allocator;

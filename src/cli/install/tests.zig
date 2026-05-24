@@ -245,7 +245,7 @@ test "install: extractVidPid ignores [output] section vid/pid" {
 test "install: generateServiceContent uses prefix" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr/local", true);
+    const content = try generateServiceContent(allocator, "/usr/local");
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "/usr/local/bin/padctl") != null);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir /usr/local/share/padctl/devices") != null);
@@ -257,7 +257,7 @@ test "install: generateServiceContent uses prefix" {
 test "install: generateServiceContent default prefix omits --config-dir" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr", true);
+    const content = try generateServiceContent(allocator, "/usr");
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "/usr/bin/padctl") != null);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir") == null);
@@ -267,7 +267,7 @@ test "install: generateServiceContent default prefix omits --config-dir" {
 test "install: generateServiceContent is user unit" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr", true);
+    const content = try generateServiceContent(allocator, "/usr");
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "WantedBy=default.target") != null);
     try testing.expect(std.mem.indexOf(u8, content, "ProtectHome") == null);
@@ -275,50 +275,21 @@ test "install: generateServiceContent is user unit" {
     try testing.expect(std.mem.indexOf(u8, content, "User=") == null);
 }
 
-test "install: generateServiceContent emits SupplementaryGroups=input when input group exists" {
-    // Falsifiability: remove the has_input_group branch in generateServiceContent → this fails.
+test "install: generateServiceContent never emits SupplementaryGroups (issues #287/#288)" {
+    // A systemd --user service manager runs unprivileged (no CAP_SETGID) and
+    // cannot apply SupplementaryGroups=; the directive aborts startup with
+    // status=216/GROUP. It must never appear in the user unit, on any host
+    // shape — whether or not the host has an 'input' group.
+    // Falsifiability: re-add the SupplementaryGroups line to
+    // generateServiceContent and this test fails.
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr", true);
-    defer allocator.free(content);
-    try testing.expect(std.mem.indexOf(u8, content, "\nSupplementaryGroups=input\n") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "User=") == null);
-}
-
-test "install: generateServiceContent omits SupplementaryGroups=input when input group absent" {
-    // Regression test for issue #279: distros using uaccess/ACL (e.g. Bazzite)
-    // have no 'input' unix group; emitting SupplementaryGroups=input causes
-    // systemd EXIT_GROUP (216) and a restart loop.
-    // Falsifiability: make generateServiceContent always emit the line → this fails.
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr", false);
-    defer allocator.free(content);
-    try testing.expect(std.mem.indexOf(u8, content, "SupplementaryGroups=input") == null);
-    try testing.expect(std.mem.indexOf(u8, content, "WantedBy=default.target") != null);
-}
-
-test "install: generateServiceContent group-present output == group-absent + single inserted line" {
-    // Pins the exact byte layout: the only difference between the two cases
-    // must be one inserted "SupplementaryGroups=input\n" line, immediately
-    // after "ExecStart=...\n". A single shared template guarantees this; this
-    // test catches any future divergence between the two cases.
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const with_group = try generateServiceContent(allocator, "/usr", true);
-    defer allocator.free(with_group);
-    const without_group = try generateServiceContent(allocator, "/usr", false);
-    defer allocator.free(without_group);
-
-    const marker = "ExecStart=/usr/bin/padctl\n";
-    const idx = std.mem.indexOf(u8, without_group, marker).?;
-    const insert_at = idx + marker.len;
-    const reconstructed = try std.fmt.allocPrint(allocator, "{s}SupplementaryGroups=input\n{s}", .{
-        without_group[0..insert_at],
-        without_group[insert_at..],
-    });
-    defer allocator.free(reconstructed);
-    try testing.expectEqualStrings(reconstructed, with_group);
+    for ([_][]const u8{ "/usr", "/usr/local" }) |prefix| {
+        const content = try generateServiceContent(allocator, prefix);
+        defer allocator.free(content);
+        try testing.expect(std.mem.indexOf(u8, content, "SupplementaryGroups") == null);
+        try testing.expect(std.mem.indexOf(u8, content, "WantedBy=default.target") != null);
+    }
 }
 
 test "install: generateSystemServiceContent group-present output == group-absent + single inserted line" {
@@ -619,7 +590,7 @@ test "install: generateServiceContent uses StateDirectory (not LogsDirectory)" {
     // the path between daemon and CLI.
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr/local", true);
+    const content = try generateServiceContent(allocator, "/usr/local");
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "StateDirectory=padctl") != null);
     try testing.expect(std.mem.indexOf(u8, content, "LogsDirectory") == null);
@@ -930,8 +901,68 @@ test "install: generateReconnectScript has required commands" {
     // Must NOT use systemctl (user service is managed by user, not udev)
     try testing.expect(std.mem.indexOf(u8, script, "systemctl") == null);
     // Must re-apply mapping on hotplug
-    try testing.expect(std.mem.indexOf(u8, script, "/usr/local/bin/padctl switch") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "padctl_bin=\"/usr/local/bin/padctl\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "\"$padctl_bin\" switch") != null);
     try testing.expect(std.mem.indexOf(u8, script, "/etc/padctl/mappings/") != null);
+}
+
+test "install: generateReconnectScript targets user-service sockets before system fallback" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const script = try generateReconnectScript(allocator, "/usr/local");
+    defer allocator.free(script);
+
+    const user_sock = std.mem.indexOf(u8, script, "/run/user/*/padctl.sock") orelse return error.MissingUserSocketGlob;
+    const system_sock = std.mem.indexOf(u8, script, "/run/padctl/padctl.sock") orelse return error.MissingSystemSocketFallback;
+    try testing.expect(user_sock < system_sock);
+    try testing.expect(std.mem.indexOf(u8, script, "--socket \"$sock\"") != null);
+}
+
+test "install: generateReconnectScript does not hard-code only the system socket" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const script = try generateReconnectScript(allocator, "/usr/local");
+    defer allocator.free(script);
+
+    try testing.expect(std.mem.indexOf(u8, script, "--socket /run/padctl/padctl.sock") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "sockets+=(\"/run/padctl/padctl.sock\")") != null);
+}
+
+test "install: generateReconnectScript runs user-socket switches as socket owner" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const script = try generateReconnectScript(allocator, "/usr/local");
+    defer allocator.free(script);
+
+    try testing.expect(std.mem.indexOf(u8, script, "uid=\"$(stat -c %u \"$sock\" 2>/dev/null)\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "passwd=\"$(getent passwd \"$uid\")\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "runuser -u \"$user\" -- env -u XDG_CONFIG_HOME HOME=\"$home\" USER=\"$user\" LOGNAME=\"$user\" XDG_RUNTIME_DIR=\"/run/user/$uid\"") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "XDG_CONFIG_HOME=\"$home/.config\"") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "\"$padctl_bin\" switch --socket \"$sock\"") == null);
+}
+
+test "install: generateReconnectScript uses default mapping before mapping-file fallback" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const script = try generateReconnectScript(allocator, "/usr/local");
+    defer allocator.free(script);
+
+    const default_switch = std.mem.indexOf(u8, script, "run_padctl_switch \"$sock\" 2>/dev/null") orelse return error.MissingDefaultSwitch;
+    const fallback_switch = std.mem.indexOf(u8, script, "run_padctl_switch \"$sock\" \"$fallback_mapping\" 2>/dev/null") orelse return error.MissingMappingFallbackSwitch;
+    try testing.expect(default_switch < fallback_switch);
+}
+
+test "install: generateReconnectScript falls back per socket without stopping early" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const script = try generateReconnectScript(allocator, "/usr/local");
+    defer allocator.free(script);
+
+    try testing.expect(std.mem.indexOf(u8, script, "run_padctl_switch \"$sock\" 2>/dev/null && exit 0") == null);
+    try testing.expect(std.mem.indexOf(u8, script, "run_padctl_switch \"$sock\" \"$fallback_mapping\" 2>/dev/null && exit 0") == null);
+    const default_switch = std.mem.indexOf(u8, script, "run_padctl_switch \"$sock\" 2>/dev/null && applied=1 && continue") orelse return error.MissingPerSocketDefault;
+    const fallback_switch = std.mem.indexOf(u8, script, "run_padctl_switch \"$sock\" \"$fallback_mapping\" 2>/dev/null && applied=1") orelse return error.MissingPerSocketFallback;
+    try testing.expect(default_switch < fallback_switch);
 }
 
 test "services: generateReconnectScript embeds correct mappings dir for prefix=/usr/local" {
@@ -2087,15 +2118,16 @@ test "install: udev rules must not contain SYSTEMD_WANTS" {
 test "install: user unit has no systemd 257+ incompatible hardening" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr", true);
+    const content = try generateServiceContent(allocator, "/usr");
     defer allocator.free(content);
     // NoNewPrivileges, LockPersonality, ProtectClock cause EXIT_CAPABILITIES (218)
     // in user scope on systemd 257+ — must be absent from the user unit.
     try testing.expect(std.mem.indexOf(u8, content, "NoNewPrivileges=") == null);
     try testing.expect(std.mem.indexOf(u8, content, "LockPersonality=") == null);
     try testing.expect(std.mem.indexOf(u8, content, "ProtectClock=") == null);
-    // SupplementaryGroups=input is NOT a systemd 257+ incompatible directive
-    // when the input group exists; only the hardening triad above is forbidden.
+    // SupplementaryGroups= is unappliable in user scope (no CAP_SETGID) and
+    // aborts startup with status=216/GROUP — must be absent (issues #287/#288).
+    try testing.expect(std.mem.indexOf(u8, content, "SupplementaryGroups") == null);
     try testing.expect(std.mem.indexOf(u8, content, "StateDirectory=padctl") != null);
 }
 
@@ -2124,7 +2156,7 @@ test "install: old system unit triggers migration hint" {
 test "install: generateServiceContent /usr prefix omits --config-dir" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr", true);
+    const content = try generateServiceContent(allocator, "/usr");
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir") == null);
     try testing.expect(std.mem.indexOf(u8, content, "ExecStart=/usr/bin/padctl\n") != null);
@@ -2133,7 +2165,7 @@ test "install: generateServiceContent /usr prefix omits --config-dir" {
 test "install: generateServiceContent non-usr prefix includes --config-dir for its own share" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const content = try generateServiceContent(allocator, "/usr/local", true);
+    const content = try generateServiceContent(allocator, "/usr/local");
     defer allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir /usr/local/share/padctl/devices") != null);
     try testing.expect(std.mem.indexOf(u8, content, "--config-dir /usr/share") == null);
