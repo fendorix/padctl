@@ -18,6 +18,7 @@ BRANCH="${BRANCH:-}"
 PREFIX="/usr/local"
 BREW_PREFIX="/home/linuxbrew/.linuxbrew"
 PADCTL_GIT_URL="${PADCTL_GIT_URL:-https://github.com/BANANASJIM/padctl.git}"
+PADCTL_REPO_AUTO_MANAGED=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -42,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         *)
             if [[ -z "$PADCTL_REPO" ]]; then
                 PADCTL_REPO="$1"
+                PADCTL_REPO_AUTO_MANAGED=false
             fi
             shift
             ;;
@@ -59,6 +61,182 @@ info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+repo_is_dirty() {
+    local repo="$1"
+    ! git -C "$repo" diff --quiet \
+        || ! git -C "$repo" diff --cached --quiet \
+        || [[ -n "$(git -C "$repo" ls-files --others --exclude-standard)" ]]
+}
+
+origin_head_ref() {
+    local repo="$1"
+    local ref
+    ref="$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    if [[ -n "$ref" ]]; then
+        echo "$ref"
+    else
+        echo "origin/main"
+    fi
+}
+
+current_upstream_ref() {
+    local repo="$1"
+    git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true
+}
+
+run_user_systemctl() {
+    local output status
+    if output="$(systemctl --user "$@" 2>&1 >/dev/null)"; then
+        return 0
+    fi
+    status=$?
+    if [[ "$output" != *"Failed to connect to bus"* && "$output" != *"No medium found"* ]]; then
+        return "$status"
+    fi
+
+    local uid user runtime bus
+    uid="$(id -u 2>/dev/null || true)"
+    user="$(id -un 2>/dev/null || true)"
+    [[ -n "$uid" && -n "$user" ]] || return 1
+
+    runtime="/run/user/$uid"
+    bus="$runtime/bus"
+    [[ -S "$bus" ]] || return 1
+    command -v sudo >/dev/null 2>&1 || return 1
+
+    sudo -u "$user" \
+        env XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+        systemctl --user "$@" >/dev/null 2>&1
+}
+
+legacy_system_service_present() {
+    systemctl is-active --quiet padctl.service >/dev/null 2>&1 \
+        || systemctl is-enabled --quiet padctl.service >/dev/null 2>&1
+}
+
+stop_existing_padctl_services() {
+    if run_user_systemctl is-active padctl.service; then
+        info "Stopping existing user padctl service..."
+        if run_user_systemctl stop padctl.service; then
+            ok "User service stopped"
+        else
+            warn "Could not stop user padctl.service; install will still try to restart it"
+        fi
+    fi
+
+    if legacy_system_service_present; then
+        warn "Stopping legacy system padctl.service to avoid a stale daemon grabbing the controller"
+        sudo systemctl stop padctl.service >/dev/null 2>&1 || warn "Could not stop legacy system padctl.service"
+        sudo systemctl disable padctl.service >/dev/null 2>&1 || warn "Could not disable legacy system padctl.service"
+        sudo systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+ensure_user_padctl_service() {
+    if ! run_user_systemctl daemon-reload; then
+        warn "Could not reload user systemd manager"
+    fi
+    if ! run_user_systemctl enable padctl.service; then
+        warn "Could not enable user padctl.service"
+    fi
+    if run_user_systemctl restart padctl.service; then
+        ok "User service restarted"
+    elif run_user_systemctl start padctl.service; then
+        ok "User service started"
+    else
+        warn "Could not start user padctl.service — check 'systemctl --user status padctl.service'"
+    fi
+}
+
+sync_managed_repo_to_remote() {
+    local repo="$1"
+    local branch="$2"
+    local target_ref current_branch
+
+    git -C "$repo" fetch origin >/dev/null 2>&1
+
+    if [[ -n "$branch" ]]; then
+        target_ref="origin/$branch"
+        if ! git -C "$repo" show-ref --verify --quiet "refs/remotes/$target_ref"; then
+            err "remote branch not found: $target_ref"
+            return 1
+        fi
+        current_branch="$branch"
+    else
+        target_ref="$(current_upstream_ref "$repo")"
+        if [[ -z "$target_ref" ]]; then
+            target_ref="$(origin_head_ref "$repo")"
+        fi
+        current_branch="$(git -C "$repo" branch --show-current 2>/dev/null || true)"
+        if [[ -z "$current_branch" && "$target_ref" == origin/* ]]; then
+            current_branch="${target_ref#origin/}"
+        fi
+    fi
+
+    warn "Fast-forward update failed; resetting managed checkout to $target_ref"
+    if repo_is_dirty "$repo"; then
+        warn "Preserving local changes in git stash before reset"
+        git -C "$repo" stash push --include-untracked \
+            -m "padctl bazzite setup auto-stash before update $(date -u +%Y%m%dT%H%M%SZ)" >/dev/null
+    fi
+
+    if [[ -n "$current_branch" ]]; then
+        git -C "$repo" checkout -B "$current_branch" "$target_ref" >/dev/null 2>&1
+    else
+        git -C "$repo" checkout --detach "$target_ref" >/dev/null 2>&1
+    fi
+    git -C "$repo" reset --hard "$target_ref" >/dev/null 2>&1
+}
+
+update_existing_repo() {
+    local repo="$1"
+    local branch="$2"
+    local auto_managed="$3"
+
+    repo_updated=false
+    if [[ -n "$branch" ]]; then
+        git -C "$repo" fetch origin >/dev/null 2>&1
+        if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+            git -C "$repo" checkout "$branch" >/dev/null 2>&1 || warn "checkout $branch failed"
+        elif git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            git -C "$repo" checkout -B "$branch" "origin/$branch" >/dev/null 2>&1 || warn "checkout $branch failed"
+        else
+            warn "branch not found locally or on origin: $branch"
+        fi
+        if timeout 10 git -C "$repo" pull --ff-only >/dev/null 2>&1; then
+            repo_updated=true
+        else
+            warn "git pull failed (might have local changes)"
+            if $auto_managed; then
+                sync_managed_repo_to_remote "$repo" "$branch"
+                repo_updated=true
+            fi
+        fi
+    else
+        # Only pull if on a branch that tracks a remote (skip for local-only branches).
+        if git -C "$repo" rev-parse --abbrev-ref '@{upstream}' &>/dev/null; then
+            if timeout 10 git -C "$repo" pull --ff-only >/dev/null 2>&1; then
+                repo_updated=true
+            else
+                warn "git pull failed (might have local changes)"
+                if $auto_managed; then
+                    sync_managed_repo_to_remote "$repo" ""
+                    repo_updated=true
+                fi
+            fi
+        elif $auto_managed; then
+            sync_managed_repo_to_remote "$repo" ""
+            repo_updated=true
+        else
+            info "Local branch with no upstream — skipping pull"
+        fi
+    fi
+}
+
+if [[ "${PADCTL_BAZZITE_TEST_LIB_ONLY:-}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # --- 1. OS Detection ---
 info "Detecting OS..."
@@ -172,32 +350,13 @@ if [[ -z "$PADCTL_REPO" ]]; then
         PADCTL_REPO="$(cd .. && pwd)"
     else
         PADCTL_REPO="$HOME/Games/padctl"
+        PADCTL_REPO_AUTO_MANAGED=true
     fi
 fi
 
 if [[ -d "$PADCTL_REPO/.git" ]]; then
     info "Updating existing repo at $PADCTL_REPO..."
-    repo_updated=false
-    if [[ -n "$BRANCH" ]]; then
-        git -C "$PADCTL_REPO" fetch origin 2>/dev/null || true
-        git -C "$PADCTL_REPO" checkout "$BRANCH" 2>/dev/null || warn "checkout $BRANCH failed"
-        if timeout 10 git -C "$PADCTL_REPO" pull --ff-only 2>/dev/null; then
-            repo_updated=true
-        else
-            warn "git pull failed (might have local changes)"
-        fi
-    else
-        # Only pull if on a branch that tracks a remote (skip for local-only branches).
-        if git -C "$PADCTL_REPO" rev-parse --abbrev-ref '@{upstream}' &>/dev/null; then
-            if timeout 10 git -C "$PADCTL_REPO" pull --ff-only 2>/dev/null; then
-                repo_updated=true
-            else
-                warn "git pull failed (might have local changes)"
-            fi
-        else
-            info "Local branch with no upstream — skipping pull"
-        fi
-    fi
+    update_existing_repo "$PADCTL_REPO" "$BRANCH" "$PADCTL_REPO_AUTO_MANAGED"
     if $repo_updated; then
         ok "Repo up to date"
     else
@@ -227,12 +386,8 @@ fi
 zig build "${build_args[@]}"
 ok "Build complete"
 
-# --- 6. Stop existing service (if running) ---
-if systemctl --user is-active padctl.service &>/dev/null; then
-    info "Stopping existing padctl service..."
-    systemctl --user stop padctl.service 2>/dev/null || true
-    ok "Service stopped"
-fi
+# --- 6. Stop existing services before overwriting the binary ---
+stop_existing_padctl_services
 
 # --- 6b. Prompt for mapping if not specified ---
 if [[ -z "$MAPPING" && -d "$PADCTL_REPO/mappings" ]]; then
@@ -276,9 +431,7 @@ ok "padctl installed to $PREFIX"
 # freshly-installed unit files take effect and the IPC socket is bound
 # before we apply the mapping and verify.
 info "Ensuring daemon is running as user..."
-systemctl --user daemon-reload 2>/dev/null || true
-systemctl --user enable padctl.service &>/dev/null || true
-systemctl --user restart padctl.service 2>/dev/null || true
+ensure_user_padctl_service
 
 # --- 7c. Apply mapping to the running daemon (config.toml persists for future boots,
 #         but the already-running daemon needs an explicit switch for the current session).
@@ -328,13 +481,13 @@ else
 fi
 
 # Check service
-if systemctl --user is-enabled padctl.service &>/dev/null; then
+if run_user_systemctl is-enabled padctl.service; then
     ok "Service: enabled"
 else
     warn "Service: not enabled (may need manual enable)"
 fi
 
-if systemctl --user is-active padctl.service &>/dev/null; then
+if run_user_systemctl is-active padctl.service; then
     ok "Service: running"
 else
     # The daemon should always be running after a successful install — it
