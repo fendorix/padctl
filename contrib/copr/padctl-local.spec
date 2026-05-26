@@ -145,6 +145,7 @@ if systemctl is-enabled padctl.service >/dev/null 2>&1; then
     mkdir -p /etc/padctl
     echo "padctl service-enabled sentinel v1" > /etc/padctl/service-enabled
     echo "prefix=/usr" >> /etc/padctl/service-enabled
+    echo "written-by=package-manager setup" >> /etc/padctl/service-enabled
 fi
 
 %preun
@@ -164,3 +165,7 @@ fi
 - Add modules-load.d, 90-padctl.rules, /etc/padctl dirs to %%files
 - Add Requires: flock (used by padctl-reconnect)
 - Update version to 0.1.7
+
+* Tue May 26 2026 padctl maintainers <maintainers@padctl.dev> - 0.1.12-1
+- Update version to 0.1.12
+- Add written-by field to service-enabled sentinel for block_kernel_drivers support
