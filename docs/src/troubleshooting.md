@@ -95,17 +95,37 @@ If your device is not listed, capture it and open a device-config contribution.
 - Xbox-compatible devices still bind to `xpad` even though their device TOML sets
   `block_kernel_drivers`.
 
-**Fix:**
+**Package-manager install fix:**
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now padctl.service
+sudo udevadm control --reload-rules
+sudo install -d -m 0755 /etc/padctl
+printf 'padctl service-enabled sentinel v1\nprefix=/usr\nwritten-by=package-manager setup\n' | sudo tee /etc/padctl/service-enabled >/dev/null
+```
+
+Then unplug and replug the controller. The sentinel activates the
+driver-block udev rule for devices whose TOML sets `block_kernel_drivers`.
+Remove it if you later disable or remove padctl:
+
+```sh
+systemctl --user disable --now padctl.service
+sudo rm -f /etc/padctl/service-enabled
+```
+
+**Source install fix:**
 
 ```sh
 sudo padctl install
-sudo udevadm trigger
 systemctl --user restart padctl.service
 ```
 
 Then unplug and replug the controller. For devices with `block_kernel_drivers`,
-the installer writes driver-block udev rules and also tries to unbind already
-attached matching devices during install.
+the source installer writes the driver-block sentinel when it enables the user
+service, installs udev rules, and also tries to unbind already attached matching
+devices during install. Do not use `sudo padctl install` as the normal fix for
+AUR or `.deb` installs because it rewrites files that the package manager owns.
 
 ---
 

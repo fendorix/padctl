@@ -10,6 +10,14 @@ yay -S padctl-git
 
 A prebuilt binary package (`padctl-bin`) is also available in the AUR.
 
+If you previously installed from source with `sudo padctl install`, remove that
+manual install before switching to AUR so pacman can own the files:
+
+```sh
+sudo padctl uninstall --prefix /usr --no-immutable
+yay -S padctl-git   # or: yay -S padctl-bin
+```
+
 ### Debian / Ubuntu
 
 ```sh
@@ -24,12 +32,31 @@ curl -fLO https://github.com/BANANASJIM/padctl/releases/latest/download/padctl_a
 sudo dpkg -i padctl_arm64.deb
 ```
 
-Package installs place the binary, udev rules, and system-wide user unit on disk.
-Enable the service from your normal login session:
+Package installs place the binary, udev rules, device configs, and system-wide
+user unit on disk. They do not run the live `padctl install` phase, so enable
+the service from your normal login session and reload udev rules:
 
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now padctl.service
+sudo udevadm control --reload-rules
+```
+
+If your controller config uses `block_kernel_drivers` (currently Flydigi Vader
+5), enable padctl's runtime driver-block sentinel before reconnecting the
+controller:
+
+```sh
+sudo install -d -m 0755 /etc/padctl
+printf 'padctl service-enabled sentinel v1\nprefix=/usr\nwritten-by=package-manager setup\n' | sudo tee /etc/padctl/service-enabled >/dev/null
+```
+
+Then unplug and replug the controller. If you later disable or remove padctl,
+remove the sentinel too:
+
+```sh
+systemctl --user disable --now padctl.service
+sudo rm -f /etc/padctl/service-enabled
 ```
 
 ## Prerequisites
@@ -93,7 +120,7 @@ sudo ./zig-out/bin/padctl install --prefix /usr --destdir "$DESTDIR"
 `padctl install` also sets up the following on all systems:
 
 - **`padctl-reconnect`** — A hotplug script triggered by udev when a controller is plugged in. It re-applies the active mapping through any running padctl daemon socket. It does not start or restart the daemon; `padctl install` enables/starts `padctl.service` unless you pass `--no-enable` or `--no-start`. After suspend/resume the kernel re-emits udev events for re-enumerated devices, so the same hook handles post-wake reconnect — no separate resume unit is needed.
-- **Driver conflict rules** — Auto-generated udev rules that unbind conflicting kernel drivers (e.g., `xpad`) from devices that padctl manages. Configured per-device via `block_kernel_drivers` in device TOML configs. When run as root, `padctl install` also walks `/sys/bus/usb/drivers/<driver>/unbind` for matching VID:PID pairs immediately, so already-bound devices are evicted without waiting for replug (issue #162).
+- **Driver conflict rules** — Auto-generated udev rules that unbind conflicting kernel drivers (e.g., `xpad`) from devices that padctl manages. Configured per-device via `block_kernel_drivers` in device TOML configs. The udev rule is gated by `/etc/padctl/service-enabled` so package installs do not detach a controller before the user service is enabled. When `padctl install` runs as root, it writes that sentinel and also walks `/sys/bus/usb/drivers/<driver>/unbind` for matching VID:PID pairs immediately, so already-bound devices are evicted without waiting for replug (issue #162).
 
 ### Install a Mapping
 
@@ -132,7 +159,7 @@ zig build
 sudo ./zig-out/bin/padctl install    # installs binary, service, device configs, and udev rules
 ```
 
-`padctl install` automatically runs `daemon-reload`, enables, and starts `padctl.service` via `sudo -u $SUDO_USER systemctl --user`. The `systemctl --user enable --now padctl.service` line is only needed if you used `--no-enable` or `--no-start`.
+`padctl install` automatically runs `daemon-reload`, enables, and starts `padctl.service` via `sudo -u $SUDO_USER systemctl --user`. It also writes `/etc/padctl/service-enabled` when the service was actually enabled, activating driver-block udev rules for devices that need them. The `systemctl --user enable --now padctl.service` line is only needed if you used `--no-enable` or `--no-start`.
 
 To auto-start at boot without an active login session (headless setups, Steam Deck game mode):
 
