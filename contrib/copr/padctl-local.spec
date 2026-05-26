@@ -140,13 +140,11 @@ sed -i "s|%{buildroot}||g" %{buildroot}%{_prefix}/lib/udev/rules.d/61-padctl-dri
 
 %post
 %systemd_post padctl.service
-# Create sentinel file to enable xpad unbinding when service is enabled
-if systemctl is-enabled padctl.service >/dev/null 2>&1; then
-    mkdir -p /etc/padctl
-    echo "padctl service-enabled sentinel v1" > /etc/padctl/service-enabled
-    echo "prefix=/usr" >> /etc/padctl/service-enabled
-    echo "written-by=package-manager setup" >> /etc/padctl/service-enabled
-fi
+# Note: The sentinel file for driver-block support must be created manually
+# or by enabling the user service. Package installs do not create it automatically
+# because users must explicitly enable the user service with:
+#   systemctl --user enable --now padctl.service
+# See docs/src/getting-started.md for the full setup instructions.
 
 %preun
 %systemd_preun padctl.service
