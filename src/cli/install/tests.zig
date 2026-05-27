@@ -642,6 +642,23 @@ test "install: generateSystemServiceContent omits SupplementaryGroups=input when
     try testing.expect(std.mem.indexOf(u8, content, "DeviceAllow=/dev/uhid rw") != null);
 }
 
+test "install: system unit declares RuntimeDirectory=padctl + Mode=0755 + Preserve=no" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const content = try generateSystemServiceContent(allocator, "/usr", false);
+    defer allocator.free(content);
+    const service_idx = std.mem.indexOf(u8, content, "\n[Service]\n") orelse return error.MissingServiceSection;
+    const install_idx = std.mem.indexOf(u8, content, "\n[Install]\n") orelse content.len;
+    inline for (.{ "\nRuntimeDirectory=padctl\n", "\nRuntimeDirectoryMode=0755\n", "\nRuntimeDirectoryPreserve=no\n" }) |needle| {
+        const idx = std.mem.indexOf(u8, content, needle) orelse return error.DirectiveMissing;
+        try testing.expect(idx > service_idx);
+        try testing.expect(idx < install_idx);
+    }
+    const user_content = try generateServiceContent(allocator, "/usr");
+    defer allocator.free(user_content);
+    try testing.expect(std.mem.indexOf(u8, user_content, "RuntimeDirectory") == null);
+}
+
 test "install: inputGroupHintNeeded suppressed when host has no input group" {
     // Falsifiability: remove the has_group guard in inputGroupHintNeeded → this fails.
     // Distros without an input group (e.g. Bazzite/Fedora) must not show usermod advice.
