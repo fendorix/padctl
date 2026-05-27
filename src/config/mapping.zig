@@ -186,6 +186,7 @@ fn scanRemapTargets(caps: *DerivedAuxCaps, cfg: *const MappingConfig, remap: *co
                                 .tap => |name| scanTarget(caps, name),
                                 .down => |name| scanTarget(caps, name),
                                 .up => |name| scanTarget(caps, name),
+                                .press => |name| scanTarget(caps, name),
                                 .delay, .pause_for_release => {},
                             }
                         }
@@ -261,6 +262,7 @@ pub const GyroConfig = struct {
     invert_x: ?bool = null,
     invert_y: ?bool = null,
     blend_stick: ?bool = null,
+    minimum_output: ?f64 = null,
 };
 
 pub const StickConfig = struct {
@@ -321,6 +323,11 @@ pub const MappingConfig = struct {
     macro: ?[]const Macro = null,
     adaptive_trigger: ?AdaptiveTriggerConfig = null,
     trigger_threshold: ?u8 = null,
+    // Global default for implicit delay (ms) between adjacent emitting macro
+    // steps. Per-macro `step_delay` overrides this. null / 0 → no insertion
+    // (byte-identical to pre-issue-333 behaviour). Applied via parse-time AST
+    // rewrite in `parseString` — see `expandMacroStepDelays`.
+    macro_step_delay: ?u32 = null,
 };
 
 pub const ParseResult = toml.Parsed(MappingConfig);
@@ -328,7 +335,10 @@ pub const ParseResult = toml.Parsed(MappingConfig);
 pub fn parseString(allocator: std.mem.Allocator, content: []const u8) !ParseResult {
     var parser = toml.Parser(MappingConfig).init(allocator);
     defer parser.deinit();
-    const result = try parser.parseString(content);
+    var result = try parser.parseString(content);
+    errdefer result.deinit();
+    try expandMacroPress(&result);
+    try expandMacroStepDelays(&result);
     if (lintUnknownFields(allocator, content)) |findings| {
         defer {
             var f = findings;
@@ -337,6 +347,115 @@ pub fn parseString(allocator: std.mem.Allocator, content: []const u8) !ParseResu
         warnLintFindings(findings.items);
     } else |_| {} // lint failure (OOM) must not break parsing
     return result;
+}
+
+fn isEmittingStep(s: MacroStep) bool {
+    return switch (s) {
+        .tap, .down, .up, .press => true,
+        .delay, .pause_for_release => false,
+    };
+}
+
+// Parse-time AST rewrite: each `{ press = "BTN" }` step expands to
+// `{ down = "BTN" }` at its original position, with `{ up = "BTN" }` steps
+// appended after the last step in reverse encounter order (LIFO unwind).
+// Having both `{ press = "BTN" }` and an explicit `{ down = "BTN" }` or
+// `{ up = "BTN" }` for the same button in the same macro is rejected as
+// ambiguous. After this function returns, no `.press` variants remain.
+fn expandMacroPress(result: *ParseResult) !void {
+    const macros = result.value.macro orelse return;
+    if (macros.len == 0) return;
+    const arena = result.arena.allocator();
+
+    var rewritten = try arena.alloc(Macro, macros.len);
+    for (macros, 0..) |m, i| {
+        rewritten[i] = m;
+
+        // Collect press targets in encounter order.
+        var press_targets: [32][]const u8 = undefined;
+        var press_count: usize = 0;
+
+        for (m.steps) |s| {
+            if (s != .press) continue;
+            if (press_count >= press_targets.len) return error.TooManyPressSteps;
+            press_targets[press_count] = s.press;
+            press_count += 1;
+        }
+        if (press_count == 0) continue;
+
+        // Validate: no explicit down/up for any press target.
+        for (m.steps) |s| {
+            const name = switch (s) {
+                .down => |n| n,
+                .up => |n| n,
+                else => continue,
+            };
+            for (press_targets[0..press_count]) |pt| {
+                if (std.mem.eql(u8, pt, name)) return error.PressConflict;
+            }
+        }
+
+        // Build expanded steps: replace .press with .down; append .up in reverse.
+        const out_len = m.steps.len + press_count;
+        var out = try arena.alloc(MacroStep, out_len);
+        var k: usize = 0;
+        for (m.steps) |s| {
+            out[k] = switch (s) {
+                .press => |n| .{ .down = n },
+                else => s,
+            };
+            k += 1;
+        }
+        // Append .up in reverse encounter order (LIFO).
+        var rev: usize = press_count;
+        while (rev > 0) {
+            rev -= 1;
+            out[k] = .{ .up = press_targets[rev] };
+            k += 1;
+        }
+        std.debug.assert(k == out_len);
+        rewritten[i].steps = out;
+    }
+    result.value.macro = rewritten;
+}
+
+// Parse-time AST rewrite: between every pair of adjacent EMITTING steps
+// (tap/down/up) insert a `delay` step. Per-macro `step_delay` wins over the
+// global `macro_step_delay`. Explicit `delay` and `pause_for_release` are not
+// considered emitting, so they suppress insertion against either neighbour.
+// Effective delay 0 (default 0, or explicit `step_delay = 0`) → identity.
+fn expandMacroStepDelays(result: *ParseResult) !void {
+    const macros = result.value.macro orelse return;
+    if (macros.len == 0) return;
+    const global = result.value.macro_step_delay;
+    const arena = result.arena.allocator();
+
+    var rewritten = try arena.alloc(Macro, macros.len);
+    for (macros, 0..) |m, i| {
+        const eff: u32 = m.step_delay orelse (global orelse 0);
+        rewritten[i] = m;
+        if (eff == 0 or m.steps.len < 2) continue;
+
+        var count: usize = m.steps.len;
+        for (m.steps[0 .. m.steps.len - 1], m.steps[1..]) |a, b| {
+            if (isEmittingStep(a) and isEmittingStep(b)) count += 1;
+        }
+        if (count == m.steps.len) continue;
+
+        var out = try arena.alloc(MacroStep, count);
+        var k: usize = 0;
+        for (m.steps, 0..) |s, j| {
+            out[k] = s;
+            k += 1;
+            if (j + 1 < m.steps.len and isEmittingStep(s) and isEmittingStep(m.steps[j + 1])) {
+                out[k] = .{ .delay = eff };
+                k += 1;
+            }
+        }
+        std.debug.assert(k == count);
+        rewritten[i].steps = out;
+    }
+    result.value.macro = rewritten;
 }
 
 pub fn parseFile(allocator: std.mem.Allocator, path: []const u8) !ParseResult {
@@ -512,6 +631,12 @@ fn validateGyroConfig(g: *const GyroConfig, trigger_threshold: ?u8) !void {
             } else if ((std.mem.eql(u8, btn_name, "LT") or std.mem.eql(u8, btn_name, "RT")) and trigger_threshold == null) {
                 std.log.warn("config: gyro activate '{s}' uses an analog trigger but trigger_threshold is not set — gate will never fire; add trigger_threshold = 128", .{spec});
             }
+        }
+    }
+
+    if (g.minimum_output) |mo| {
+        if (mo > 1.0) {
+            std.log.warn("config: gyro minimum_output {d:.3} > 1.0 — will be clamped to 1.0", .{mo});
         }
     }
 }
@@ -1596,6 +1721,19 @@ test "lintUnknownFields: [[macro]] steps array does not mis-flag inline-table ke
     // `tap`, `down`, `up`, `delay` appear inside `steps = [...]` array — they
     // must not be classified as Macro fields and must not flag.
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "lintUnknownFields: hold_timeout on [[macro]] is flagged (issue #331)" {
+    const allocator = std.testing.allocator;
+    const toml_str =
+        \\[[macro]]
+        \\name = "quick"
+        \\hold_timeout = 5
+        \\steps = [{ tap = "A" }]
+    ;
+    var findings = try lintUnknownFields(allocator, toml_str);
+    defer findings.deinit(allocator);
+    try std.testing.expect(findFinding(findings.items, "macro", "hold_timeout") != null);
 }
 
 test "lintUnknownFields: forward-compat field flagged once with table context" {

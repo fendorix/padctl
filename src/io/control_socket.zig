@@ -5,11 +5,32 @@ const linux = std.os.linux;
 const MAX_CLIENTS = 4;
 const BUF_SIZE = 256;
 
+/// Suffix joined to the socket's parent directory to advertise the bound path.
+pub const ADVERTISED_FILE_NAME = "socket.advertised";
+
+const unix_path_len = @typeInfo(@TypeOf(@as(linux.sockaddr.un, undefined).path)).array.len;
+
+/// Returns true if a live daemon is bound to `path` (connect(AF_UNIX) succeeds).
+/// Used both by `ControlSocket.init` (refuse to start when another instance owns
+/// the socket) and by the install/uninstall flow (refuse to unlink under a
+/// running daemon — issue #216).
+pub fn probeAlive(path: []const u8) bool {
+    if (path.len == 0 or path.len >= unix_path_len) return false;
+    const probe_fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch return false;
+    defer posix.close(probe_fd);
+    var addr: linux.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
+    @memset(&addr.path, 0);
+    @memcpy(addr.path[0..path.len], path);
+    posix.connect(probe_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un)) catch return false;
+    return true;
+}
+
 pub const ControlSocket = struct {
     listen_fd: posix.fd_t,
     client_fds: [MAX_CLIENTS]posix.fd_t,
     client_count: usize,
     path: []const u8,
+    advertised_path: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub const InitError = posix.SocketError || posix.BindError || posix.ListenError || std.fs.Dir.MakeError || std.mem.Allocator.Error || error{ AlreadyRunning, ChmodFailed, PathTooLong };
@@ -19,22 +40,14 @@ pub const ControlSocket = struct {
         defer allocator.free(path_z);
 
         const dir = std.fs.path.dirname(path) orelse "/run";
+        // systemd RuntimeDirectory= creates this when service is active;
+        // defensive for daemon started outside systemd (dev/test/foreground).
         std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
 
-        // Probe: if a live daemon owns the socket, refuse to start.
-        // Skip for over-length paths (PathTooLong will be returned below).
-        if (path_z.len < @as(usize, @typeInfo(@TypeOf(@as(linux.sockaddr.un, undefined).path)).array.len)) probe: {
-            const probe_fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch break :probe;
-            defer posix.close(probe_fd);
-            var probe_addr: linux.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
-            @memset(&probe_addr.path, 0);
-            @memcpy(probe_addr.path[0..path_z.len], path_z[0..path_z.len]);
-            posix.connect(probe_fd, @ptrCast(&probe_addr), @sizeOf(linux.sockaddr.un)) catch break :probe;
-            return error.AlreadyRunning;
-        }
+        if (probeAlive(path)) return error.AlreadyRunning;
 
         // Unlink stale socket
         std.fs.deleteFileAbsolute(path) catch {};
@@ -56,12 +69,19 @@ pub const ControlSocket = struct {
         try posix.listen(fd, 4);
 
         const path_owned = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_owned);
+
+        const advertised_path = writeAdvertisedFile(allocator, path) catch |err| blk: {
+            std.log.warn("control socket: advertised file write failed: {}", .{err});
+            break :blk null;
+        };
 
         return .{
             .listen_fd = fd,
             .client_fds = .{ -1, -1, -1, -1 },
             .client_count = 0,
             .path = path_owned,
+            .advertised_path = advertised_path,
             .allocator = allocator,
         };
     }
@@ -75,6 +95,11 @@ pub const ControlSocket = struct {
         }
         self.client_count = 0;
         posix.close(self.listen_fd);
+        if (self.advertised_path) |ap| {
+            std.fs.deleteFileAbsolute(ap) catch {};
+            self.allocator.free(ap);
+            self.advertised_path = null;
+        }
         std.fs.deleteFileAbsolute(self.path) catch {};
         self.allocator.free(self.path);
     }
@@ -201,6 +226,23 @@ pub fn parseCommand(raw: []const u8) Command {
         return .{ .tag = .unknown };
     }
     return .{ .tag = .unknown };
+}
+
+/// Returns the absolute advertised-file path for a given socket path
+/// (`<dirname>/socket.advertised`). Caller owns the returned memory.
+pub fn advertisedFilePath(allocator: std.mem.Allocator, socket_path: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(socket_path) orelse "/";
+    return std.fs.path.join(allocator, &.{ dir, ADVERTISED_FILE_NAME });
+}
+
+fn writeAdvertisedFile(allocator: std.mem.Allocator, socket_path: []const u8) ![]u8 {
+    const ap = try advertisedFilePath(allocator, socket_path);
+    errdefer allocator.free(ap);
+
+    var file = try std.fs.createFileAbsolute(ap, .{ .truncate = true, .mode = 0o644 });
+    defer file.close();
+    try file.writeAll(socket_path);
+    return ap;
 }
 
 fn containsPathTraversal(s: []const u8) bool {
@@ -450,4 +492,61 @@ test "control_socket: ControlSocket: init rejects overly long unix socket path" 
     defer allocator.free(socket_path);
 
     try testing.expectError(error.PathTooLong, ControlSocket.init(allocator, socket_path));
+}
+
+// Falsifiability: delete the writeAdvertisedFile call in ControlSocket.init,
+// and this test must FAIL — the advertised file will not exist and
+// accessAbsolute returns error.FileNotFound.
+test "control_socket: ControlSocket: init writes advertised file with socket path" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const socket_path = try std.fs.path.join(allocator, &.{ root, "adv.sock" });
+    defer allocator.free(socket_path);
+
+    var cs = ControlSocket.init(allocator, socket_path) catch |err| {
+        if (err == error.AccessDenied) return;
+        return err;
+    };
+    defer cs.deinit();
+
+    const expected_ap = try advertisedFilePath(allocator, socket_path);
+    defer allocator.free(expected_ap);
+    try std.fs.accessAbsolute(expected_ap, .{});
+
+    var file = try std.fs.openFileAbsolute(expected_ap, .{});
+    defer file.close();
+    var buf: [256]u8 = undefined;
+    const n = try file.readAll(&buf);
+    try testing.expectEqualStrings(socket_path, buf[0..n]);
+}
+
+// Falsifiability: drop the deleteFileAbsolute(self.advertised_path) branch in
+// deinit, and this test must FAIL — accessAbsolute will succeed.
+test "control_socket: ControlSocket: deinit removes advertised file" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const socket_path = try std.fs.path.join(allocator, &.{ root, "advd.sock" });
+    defer allocator.free(socket_path);
+
+    var cs = ControlSocket.init(allocator, socket_path) catch |err| {
+        if (err == error.AccessDenied) return;
+        return err;
+    };
+
+    const expected_ap = try advertisedFilePath(allocator, socket_path);
+    defer allocator.free(expected_ap);
+    try std.fs.accessAbsolute(expected_ap, .{});
+
+    cs.deinit();
+    try testing.expectError(error.FileNotFound, std.fs.accessAbsolute(expected_ap, .{}));
 }

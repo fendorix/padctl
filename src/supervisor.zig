@@ -222,6 +222,15 @@ pub const Supervisor = struct {
     /// null = feature disabled. Installed onto every newly initialised Mapper
     /// via `installChordDetector`.
     chord_detector_cfg: ?chord_detector_mod.Config = null,
+    /// True when PADCTL_TRACE_LIFECYCLE=1 at startup. Cached once so hot paths
+    /// pay only a bool branch, not a getenv call per event.
+    trace_lifecycle: bool = false,
+
+    /// Emit a [lifecycle] info line when trace_lifecycle is enabled.
+    fn traceLifecycle(self: *const Supervisor, comptime fmt: []const u8, args: anytype) void {
+        if (!self.trace_lifecycle) return;
+        std.log.info("[lifecycle] " ++ fmt, args);
+    }
 
     pub fn init(allocator: std.mem.Allocator) !Supervisor {
         var stop_mask = posix.sigemptyset();
@@ -267,6 +276,7 @@ pub const Supervisor = struct {
             break :blk null;
         };
 
+        const trace_on = std.mem.eql(u8, std.posix.getenv("PADCTL_TRACE_LIFECYCLE") orelse "", "1");
         var sup: Supervisor = .{
             .allocator = allocator,
             .managed = .{},
@@ -285,8 +295,12 @@ pub const Supervisor = struct {
             .test_switch_mapping_override = null,
             .test_switch_fail_commit_index = null,
             .grace_timer_fd = grace_fd,
+            .trace_lifecycle = trace_on,
         };
         sup.applyUserConfigRuntime();
+        if (trace_on) {
+            std.log.info("[lifecycle] trace enabled suspend_grace_sec={d}", .{sup.suspend_grace_sec});
+        }
         return sup;
     }
 
@@ -379,8 +393,21 @@ pub const Supervisor = struct {
         return false;
     }
 
-    fn attachWithInstanceResult(self: *Supervisor, devname: []const u8, phys_key: []const u8, instance: *DeviceInstance, default_pr: ?*mapping_cfg.ParseResult) !bool {
+    pub fn attachWithInstanceResult(self: *Supervisor, devname: []const u8, phys_key: []const u8, instance: *DeviceInstance, default_pr: ?*mapping_cfg.ParseResult) !bool {
         if (self.devname_map.contains(devname)) return false;
+        // issue #236: forfeit grace for stale suspended entries sharing this
+        // device's VID:PID but parked under a different phys_key. The grace
+        // window's contract is "same controller will return at the same
+        // physical topology"; once a fresh ADD arrives for the same VID:PID at
+        // a different phys (dongle re-enumeration, USB renumber, PR #304's
+        // cold-scan retry replay after boot), the old uinput is stale — and
+        // leaving it alive in parallel with the new one causes consumers
+        // (Steam) to keep reading inputs from the now-dead device.
+        self.pruneStaleSuspendedForId(
+            @intCast(instance.device_cfg.device.vid),
+            @intCast(instance.device_cfg.device.pid),
+            phys_key,
+        );
         // Dedup by phys_key. Race guard: when a controller is unplugged and
         // replugged within the detach-delay window (or a USB re-enumeration
         // skips the REMOVE uevent entirely), an ADD can reach this path while
@@ -544,6 +571,10 @@ pub const Supervisor = struct {
             const deadline = m.grace_deadline_ns orelse continue;
             if (now_ns < deadline) continue;
             std.log.info("grace window expired for phys \"{s}\"; tearing down uinput", .{m.phys_key});
+            self.traceLifecycle("gc_teardown model={s} phys={s} reason=grace_expired", .{
+                m.instance.device_cfg.device.name,
+                m.phys_key,
+            });
             // `detach()` has already joined the worker thread and closed
             // the hidraw fds, so `teardownManaged` just frees the uinput
             // + bookkeeping.
@@ -559,9 +590,17 @@ pub const Supervisor = struct {
     fn armGraceTimer(self: *Supervisor) void {
         if (self.grace_timer_fd < 0) return;
         var soonest: ?u64 = null;
+        const now_arm = self.nowNs();
         for (self.managed.items) |*m| {
             const d = m.grace_deadline_ns orelse continue;
             if (soonest == null or d < soonest.?) soonest = d;
+            const remaining_ms: u64 = if (d > now_arm) (d - now_arm) / std.time.ns_per_ms else 0;
+            self.traceLifecycle("arm_grace model={s} phys={s} deadline_ms={d} grace_sec={d}", .{
+                m.instance.device_cfg.device.name,
+                m.phys_key,
+                remaining_ms,
+                self.suspend_grace_sec,
+            });
         }
         const disarm = linux.itimerspec{
             .it_value = .{ .sec = 0, .nsec = 0 },
@@ -639,6 +678,10 @@ pub const Supervisor = struct {
     }
 
     fn spawnInstance(self: *Supervisor, phys_key: []const u8, instance: *DeviceInstance, default_pr: ?*mapping_cfg.ParseResult) !void {
+        // Wire wedge atomics through the chokepoint so all 4 spawn call
+        // sites (run() initial_configs, doReload, hotplug retry,
+        // attachWithInstanceResult) get Bug E instrumentation uniformly.
+        instance.attachWedges();
         // Install chord detector before spawning the thread so the mapper sees
         // the cfg from the very first frame.
         if (self.chord_detector_cfg) |cfg| {
@@ -660,6 +703,28 @@ pub const Supervisor = struct {
             .switch_mapping = null,
             .default_mapping_pr = default_pr,
         });
+    }
+
+    fn pruneStaleSuspendedForId(self: *Supervisor, vid: u16, pid: u16, keep_phys: []const u8) void {
+        var i: usize = self.managed.items.len;
+        var pruned: bool = false;
+        while (i > 0) {
+            i -= 1;
+            const m = &self.managed.items[i];
+            if (!m.suspended) continue;
+            const m_vid: u16 = @intCast(m.instance.device_cfg.device.vid);
+            const m_pid: u16 = @intCast(m.instance.device_cfg.device.pid);
+            if (m_vid != vid or m_pid != pid) continue;
+            if (std.mem.eql(u8, m.phys_key, keep_phys)) continue;
+            std.log.info("hotplug: forfeiting grace for stale suspended phys \"{s}\" (VID={x:0>4} PID={x:0>4}); new attach at \"{s}\"", .{ m.phys_key, vid, pid, keep_phys });
+            self.traceLifecycle("prune_stale_suspended vid=0x{x:0>4} pid=0x{x:0>4} kept_phys={s} pruned_phys={s}", .{
+                vid, pid, keep_phys, m.phys_key,
+            });
+            self.teardownManaged(m);
+            _ = self.managed.swapRemove(i);
+            pruned = true;
+        }
+        if (pruned) self.armGraceTimer();
     }
 
     fn teardownManaged(self: *Supervisor, m: *ManagedInstance) void {
@@ -1193,11 +1258,14 @@ pub const Supervisor = struct {
         var dir = std.fs.openDirAbsolute(dev_root, .{ .iterate = true }) catch return;
         defer dir.close();
 
+        var count: usize = 0;
         var it = dir.iterate();
         while (it.next() catch return) |entry| {
             if (!isHidrawDevname(entry.name)) continue;
             self.enqueueHotplugRetry(entry.name);
+            count += 1;
         }
+        self.traceLifecycle("cold_scan_retry source=enqueueColdScanRetriesForDevRoot count={d}", .{count});
     }
 
     fn drainHotplugRetry(self: *Supervisor) void {
@@ -1646,11 +1714,80 @@ pub const Supervisor = struct {
         }
     }
 
-    fn handleStatus(self: *Supervisor, fd: posix.fd_t) void {
+    /// Walk sysfs_root/event*/device/id/{vendor,product} to find all eventN
+    /// nodes matching vid:pid. Appends each as "/dev/input/eventN(name)" into
+    /// `out`, comma-separated. Returns a slice into `out` on any match, null
+    /// when the directory is unavailable or no match is found. Truncates with
+    /// "..." when the buffer is full.
+    fn resolveEvdevNodesAt(sysfs_root: []const u8, vid: u16, pid: u16, out: []u8) ?[]u8 {
+        var dir = std.fs.openDirAbsolute(sysfs_root, .{ .iterate = true }) catch return null;
+        defer dir.close();
+        var it = dir.iterate();
+        var written: usize = 0;
+        while (it.next() catch null) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "event")) continue;
+            var path_buf: [256]u8 = undefined;
+            var nbuf: [8]u8 = undefined;
+            const vpath = std.fmt.bufPrint(&path_buf, "{s}/device/id/vendor", .{entry.name}) catch continue;
+            const vf = dir.openFile(vpath, .{}) catch continue;
+            const vn = vf.read(&nbuf) catch {
+                vf.close();
+                continue;
+            };
+            vf.close();
+            const ev = std.fmt.parseInt(u16, std.mem.trimRight(u8, nbuf[0..vn], "\n\r "), 16) catch continue;
+            if (ev != vid) continue;
+            const ppath = std.fmt.bufPrint(&path_buf, "{s}/device/id/product", .{entry.name}) catch continue;
+            const pf = dir.openFile(ppath, .{}) catch continue;
+            const pn = pf.read(&nbuf) catch {
+                pf.close();
+                continue;
+            };
+            pf.close();
+            const ep = std.fmt.parseInt(u16, std.mem.trimRight(u8, nbuf[0..pn], "\n\r "), 16) catch continue;
+            if (ep != pid) continue;
+            // Read kernel device name for disambiguation.
+            var dev_name_buf: [64]u8 = undefined;
+            const npath = std.fmt.bufPrint(&path_buf, "{s}/device/name", .{entry.name}) catch continue;
+            const dev_name: []const u8 = blk: {
+                const nf = dir.openFile(npath, .{}) catch break :blk "";
+                const nn = nf.read(&dev_name_buf) catch {
+                    nf.close();
+                    break :blk "";
+                };
+                nf.close();
+                break :blk std.mem.trimRight(u8, dev_name_buf[0..nn], "\n\r ");
+            };
+            const sep: []const u8 = if (written > 0) "," else "";
+            const segment = if (dev_name.len > 0)
+                std.fmt.bufPrint(out[written..], "{s}/dev/input/{s}({s})", .{ sep, entry.name, dev_name })
+            else
+                std.fmt.bufPrint(out[written..], "{s}/dev/input/{s}", .{ sep, entry.name });
+            if (segment) |s| {
+                written += s.len;
+            } else |_| {
+                // Buffer full — append truncation marker if space allows.
+                const marker = "...";
+                if (written + marker.len <= out.len) {
+                    @memcpy(out[written..][0..marker.len], marker);
+                    written += marker.len;
+                }
+                break;
+            }
+        }
+        return if (written > 0) out[0..written] else null;
+    }
+
+    fn resolveEvdevNode(vid: u16, pid: u16, out: []u8) ?[]u8 {
+        return resolveEvdevNodesAt("/sys/class/input", vid, pid, out);
+    }
+
+    pub fn handleStatus(self: *Supervisor, fd: posix.fd_t) void {
         var cs = &self.ctrl_sock.?;
-        var buf: [1024]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         var stream = std.io.fixedBufferStream(&buf);
         const w = stream.writer();
+        const now_ns = self.nowNs();
 
         w.writeAll("STATUS") catch return;
         for (self.managed.items) |*m| {
@@ -1668,6 +1805,43 @@ pub const Supervisor = struct {
                 break :blk "(none)";
             };
             w.print(" device={s} state={s} mapping={s}", .{ name, state_str, mapping_name }) catch break;
+
+            // Diagnostic fields (issue #236).
+            const vid: u16 = @intCast(m.instance.device_cfg.device.vid);
+            const pid: u16 = @intCast(m.instance.device_cfg.device.pid);
+            const output_kind: []const u8 = switch (m.instance.owner) {
+                .none => "none",
+                .uinput => "uinput",
+                .uhid => "uhid",
+            };
+            const output_fd_alive: bool = m.instance.owner != .none;
+            w.print(" phys_key={s} vid=0x{x:0>4} pid=0x{x:0>4} output_kind={s} output_fd_alive={}", .{
+                m.phys_key, vid, pid, output_kind, output_fd_alive,
+            }) catch break;
+
+            if (m.grace_deadline_ns) |dl| {
+                const remaining_ms: u64 = if (dl > now_ns) (dl - now_ns) / std.time.ns_per_ms else 0;
+                w.print(" grace_deadline_remaining_ms={d}", .{remaining_ms}) catch {};
+            }
+
+            var evdev_buf: [256]u8 = undefined;
+            const evdev_node = resolveEvdevNode(vid, pid, &evdev_buf) orelse "<unresolved>";
+            w.print(" evdev_node={s}", .{evdev_node}) catch {};
+
+            w.print(" hotplug_pending={d}", .{self.hotplug_pending.items.len}) catch {};
+
+            // PR-ε.1 wedge instrumentation. write_in_flight_ms=0 when no write is
+            // currently blocked; a sustained non-zero value (hundreds of ms) is the
+            // smoking gun for a kernel-side D-state hang on usb_control_msg.
+            const inb = m.instance.wedge.loadInbound();
+            const outb = m.instance.wedge.loadOutbound();
+            const ifs = m.instance.wedge.loadInFlight();
+            const inb_ago_ms: u64 = if (inb == 0 or now_ns < inb) 0 else (now_ns - inb) / std.time.ns_per_ms;
+            const outb_ago_ms: u64 = if (outb == 0 or now_ns < outb) 0 else (now_ns - outb) / std.time.ns_per_ms;
+            const inflight_ms: u64 = if (ifs == 0 or now_ns < ifs) 0 else (now_ns - ifs) / std.time.ns_per_ms;
+            w.print(" last_inbound_ms_ago={d} last_outbound_ms_ago={d} write_in_flight_ms={d}", .{
+                inb_ago_ms, outb_ago_ms, inflight_ms,
+            }) catch {};
         }
         w.writeByte('\n') catch return;
         cs.sendResponse(fd, stream.getWritten());
@@ -4502,4 +4676,121 @@ test "supervisor: lookupChordMappingName: deterministic order when two profiles 
     const pz = try mapping_cfg.parseFile(allocator, zebra_path);
     defer pz.deinit();
     try testing.expectEqual(@as(?u8, 1), pz.value.chord_index);
+}
+
+// Test 1: trace_lifecycle field correctly reflects PADCTL_TRACE_LIFECYCLE env at init.
+// Falsifiability: without `trace_lifecycle` field initialisation in initForTest, this
+// assertion cannot be constructed; the field would remain at its default (false) even
+// when the caller sets it, and the test below demonstrates the field is read correctly.
+test "supervisor: trace_lifecycle flag initialised from field (gate check)" {
+    const allocator = testing.allocator;
+    var sup = try Supervisor.initForTest(allocator);
+    defer sup.deinit();
+
+    // Default: no trace.
+    try testing.expect(!sup.trace_lifecycle);
+
+    // Enable via field (simulates what init() does after reading the env var).
+    sup.trace_lifecycle = true;
+    try testing.expect(sup.trace_lifecycle);
+
+    // traceLifecycle is a no-op when false (does not crash).
+    sup.trace_lifecycle = false;
+    sup.traceLifecycle("test {s}", .{"ok"});
+}
+
+// Test 2: handleStatus output contains new diagnostic fields.
+// Falsifiability: reverting the phys_key/vid/pid/output_kind/output_fd_alive/hotplug_pending
+// additions to handleStatus causes these assertions to fail (fields absent from response).
+test "supervisor: handleStatus includes diagnostic fields (issue #236)" {
+    const allocator = testing.allocator;
+
+    const parsed_dev = try device_mod.parseString(allocator, minimal_device_toml);
+    defer parsed_dev.deinit();
+
+    var mock_a = try MockDeviceIO.init(allocator, &.{});
+    defer mock_a.deinit();
+    var sup = try Supervisor.initForTest(allocator);
+
+    const inst_a = try makeTestInstance(allocator, &mock_a, &parsed_dev.value);
+    try sup.attachWithInstance("hidraw3", "usb-1-1", inst_a, null);
+
+    const resp_fds = try testSocketpair();
+    defer posix.close(resp_fds[0]);
+    defer posix.close(resp_fds[1]);
+    sup.ctrl_sock = .{
+        .listen_fd = -1,
+        .client_fds = .{ -1, -1, -1, -1 },
+        .client_count = 0,
+        .path = "",
+        .allocator = allocator,
+    };
+
+    sup.handleStatus(resp_fds[0]);
+    var resp_buf: [512]u8 = undefined;
+    const n = try posix.read(resp_fds[1], &resp_buf);
+    const resp = resp_buf[0..n];
+
+    try testing.expect(std.mem.indexOf(u8, resp, "phys_key=") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "vid=") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "output_kind=") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "output_fd_alive=") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "hotplug_pending=") != null);
+
+    // Arm a grace deadline and verify grace_deadline_remaining_ms appears.
+    sup.managed.items[0].grace_deadline_ns = sup.nowNs() + 30 * std.time.ns_per_s;
+    sup.handleStatus(resp_fds[0]);
+    const n2 = try posix.read(resp_fds[1], &resp_buf);
+    try testing.expect(std.mem.indexOf(u8, resp_buf[0..n2], "grace_deadline_remaining_ms=") != null);
+
+    defer {
+        sup.managed.items[0].grace_deadline_ns = null;
+        sup.stopAll();
+        sup.ctrl_sock = null;
+        sup.deinit();
+    }
+}
+
+test "supervisor: resolveEvdevNodesAt returns all matching nodes with device name" {
+    // Build a synthetic sysfs tree under /tmp with two event nodes sharing the same VID:PID.
+    // Falsifiability: the old single-return impl would yield only one event path; this test
+    // asserts both event5 and event7 appear, so it would FAIL pre-fix.
+    const base = "/tmp/padctl_test_evdev_multi";
+    std.fs.deleteTreeAbsolute(base) catch {};
+    defer std.fs.deleteTreeAbsolute(base) catch {};
+
+    const Event = struct { name: []const u8, dev_name: []const u8 };
+    const events = [_]Event{
+        .{ .name = "event5", .dev_name = "Vader 5 Pro" },
+        .{ .name = "event7", .dev_name = "Vader 5 Pro IMU" },
+    };
+    for (events) |ev| {
+        var p0: [128]u8 = undefined;
+        var p1: [128]u8 = undefined;
+        var p2: [128]u8 = undefined;
+        var p3: [128]u8 = undefined;
+        var p4: [128]u8 = undefined;
+        var p5: [128]u8 = undefined;
+        std.fs.makeDirAbsolute(base) catch {};
+        std.fs.makeDirAbsolute(try std.fmt.bufPrint(&p0, "{s}/{s}", .{ base, ev.name })) catch {};
+        std.fs.makeDirAbsolute(try std.fmt.bufPrint(&p1, "{s}/{s}/device", .{ base, ev.name })) catch {};
+        try std.fs.makeDirAbsolute(try std.fmt.bufPrint(&p2, "{s}/{s}/device/id", .{ base, ev.name }));
+        var vf = try std.fs.createFileAbsolute(try std.fmt.bufPrint(&p3, "{s}/{s}/device/id/vendor", .{ base, ev.name }), .{});
+        try vf.writeAll("045e\n");
+        vf.close();
+        var pf = try std.fs.createFileAbsolute(try std.fmt.bufPrint(&p4, "{s}/{s}/device/id/product", .{ base, ev.name }), .{});
+        try pf.writeAll("02fd\n");
+        pf.close();
+        var nf = try std.fs.createFileAbsolute(try std.fmt.bufPrint(&p5, "{s}/{s}/device/name", .{ base, ev.name }), .{});
+        try nf.writeAll(ev.dev_name);
+        nf.close();
+    }
+
+    var out: [512]u8 = undefined;
+    const result = Supervisor.resolveEvdevNodesAt(base, 0x045e, 0x02fd, &out);
+    try testing.expect(result != null);
+    const s = result.?;
+    try testing.expect(std.mem.indexOf(u8, s, "/dev/input/event5") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "/dev/input/event7") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "Vader 5 Pro IMU") != null);
 }

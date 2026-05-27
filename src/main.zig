@@ -102,6 +102,10 @@ pub const testing_support = struct {
     pub const gyro_stick_e2e_test = @import("test/gyro_stick_e2e_test.zig");
     pub const macro_e2e_test = @import("test/macro_e2e_test.zig");
     pub const macro_gamepad_button_test = @import("test/macro_gamepad_button_test.zig");
+    pub const macro_step_delay_test = @import("test/macro_step_delay_test.zig");
+    pub const macro_press_sugar_test = @import("test/macro_press_sugar_test.zig");
+    pub const macro_axis_dispatch_test = @import("test/macro_axis_dispatch_test.zig");
+    pub const macro_pause_release_layer_drain_test = @import("test/macro_pause_release_layer_drain_test.zig");
     pub const capture_e2e_test = @import("test/capture_e2e_test.zig");
     pub const supervisor_e2e_test = @import("test/supervisor_e2e_test.zig");
     pub const wasm_e2e_test = @import("test/wasm_e2e_test.zig");
@@ -144,6 +148,9 @@ pub const testing_support = struct {
     pub const uhid_simulator = @import("test/harness/uhid_simulator.zig");
     pub const uhid_test_cleanup = @import("test/uhid_test_cleanup.zig");
     pub const device_instance_imu_ownership_test = @import("test/device_instance_imu_ownership_test.zig");
+    pub const supervisor_suspended_attach_takeover_test = @import("test/supervisor_suspended_attach_takeover_test.zig");
+    pub const supervisor_suspend_output_continuity_test = @import("test/supervisor_suspend_output_continuity_test.zig");
+    pub const wedge_instrumentation_test = @import("test/wedge_instrumentation_test.zig");
     // Permanent canary — proves test discovery walks into testing_support.
     // If the discovery mechanism breaks again, this test stops running and
     // we can prove the regression with a deliberate failure.
@@ -176,6 +183,34 @@ const DeviceIO = io.device_io.DeviceIO;
 const VERSION = @import("build_options").version;
 
 pub const DumpAction = enum { enable, disable, status, @"export", clear };
+
+fn parseScope(v: []const u8) ?cli.install.LifecycleScope {
+    if (std.mem.eql(u8, v, "system")) return .system;
+    if (std.mem.eql(u8, v, "user")) return .user;
+    if (std.mem.eql(u8, v, "package")) return .package;
+    return null;
+}
+
+fn reportScopeOrLog(err: anyerror, phase_name: []const u8) void {
+    switch (err) {
+        error.NonRootSystemPrefix => {
+            _ = std.posix.write(std.posix.STDERR_FILENO,
+                \\error: system-scope install requires root.
+                \\  Either run with sudo, or use:
+                \\    padctl install --scope=user --prefix="$HOME/.local"
+                \\
+            ) catch {};
+        },
+        error.RootUserScopeNoSudoUser => {
+            _ = std.posix.write(std.posix.STDERR_FILENO,
+                \\error: cannot determine target user for --scope=user under root.
+                \\  Run with:  sudo -u <user> padctl install --scope=user
+                \\
+            ) catch {};
+        },
+        else => std.log.err("{s} failed: {}", .{ phase_name, err }),
+    }
+}
 
 const Cli = struct {
     allocator: std.mem.Allocator,
@@ -266,6 +301,12 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     opts.user_service = true;
                 } else if (std.mem.eql(u8, iarg, "--no-user-service")) {
                     opts.user_service = false;
+                } else if (std.mem.eql(u8, iarg, "--scope")) {
+                    const v = args.next() orelse return error.MissingArgValue;
+                    opts.scope = parseScope(v) orelse {
+                        std.log.err("invalid --scope value: {s} (expected system|user|package)", .{v});
+                        return error.UnknownArgument;
+                    };
                 } else {
                     std.log.err("unknown install argument: {s}", .{iarg});
                     return error.UnknownArgument;
@@ -291,6 +332,12 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     opts.no_immutable = true;
                 } else if (std.mem.eql(u8, iarg, "--mapping")) {
                     try mapping_list.append(allocator, args.next() orelse return error.MissingArgValue);
+                } else if (std.mem.eql(u8, iarg, "--scope")) {
+                    const v = args.next() orelse return error.MissingArgValue;
+                    opts.scope = parseScope(v) orelse {
+                        std.log.err("invalid --scope value: {s} (expected system|user|package)", .{v});
+                        return error.UnknownArgument;
+                    };
                 } else {
                     std.log.err("unknown uninstall argument: {s}", .{iarg});
                     return error.UnknownArgument;
@@ -654,7 +701,7 @@ pub fn main() !void {
     // install subcommand
     if (parsed.install_opts) |opts| {
         cli.install.run(allocator, opts) catch |err| {
-            std.log.err("install failed: {}", .{err});
+            reportScopeOrLog(err, "install");
             std.process.exit(1);
         };
         std.process.exit(0);
@@ -663,7 +710,7 @@ pub fn main() !void {
     // uninstall subcommand
     if (parsed.uninstall_opts) |opts| {
         cli.install.uninstall(allocator, opts) catch |err| {
-            std.log.err("uninstall failed: {}", .{err});
+            reportScopeOrLog(err, "uninstall");
             std.process.exit(1);
         };
         std.process.exit(0);
@@ -1110,6 +1157,7 @@ test {
     // hid_hw_open in the kernel, which can deadlock under SIGKILL/OOM (the
     // SIGTERM handler has no SIGKILL path). Run via: zig build test-uhid
     _ = @import("test/macro_gamepad_button_test.zig");
+    _ = @import("test/macro_axis_dispatch_test.zig");
     _ = @import("test/macro_e2e_test.zig");
     _ = @import("test/properties/config_props.zig");
     _ = @import("test/properties/contract_props.zig");
