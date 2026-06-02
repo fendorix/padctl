@@ -40,12 +40,13 @@ pub const Slots = struct {
     pub const layer_timer: usize = 2;
     pub const rumble_stop: usize = 3;
     pub const macro_timer: usize = 4;
-    pub const device_base: usize = 5;
+    pub const rumble_max_duration: usize = 5;
+    pub const device_base: usize = 6;
 };
 
-// signal + stop + layer_timer + rumble_stop + macro_timer = 5 fixed; up to 6 device interfaces;
+// signal + stop + layer_timer + rumble_stop + macro_timer + rumble_max_duration = 6 fixed; up to 6 device interfaces;
 // plus 1 uinput FF slot and 1 UHID output slot appended after device fds.
-pub const FIXED_SLOT_COUNT: usize = 5;
+pub const FIXED_SLOT_COUNT: usize = 6;
 pub const MAX_DEVICE_INTERFACES: usize = 6;
 pub const MAX_FDS: usize = FIXED_SLOT_COUNT + MAX_DEVICE_INTERFACES + 2;
 
@@ -129,6 +130,16 @@ fn autoStopEnabled(dcfg: ?*const DeviceConfig) bool {
     const out = cfg.output orelse return true;
     const ff = out.force_feedback orelse return true;
     return ff.auto_stop;
+}
+
+/// Returns the max rumble duration in milliseconds from config.
+/// Defaults to 10000ms (10 seconds) when not explicitly set.
+/// Returns 0 if the safety cap should be disabled.
+fn maxRumbleDurationMs(dcfg: ?*const DeviceConfig) i64 {
+    const cfg = dcfg orelse return 10000;
+    const out = cfg.output orelse return 10000;
+    const ff = out.force_feedback orelse return 10000;
+    return ff.max_rumble_duration_ms;
 }
 
 /// Format scheduler slot state with relative deltas from now_ns.
@@ -242,8 +253,11 @@ fn quiesceTimersAndRumbleImpl(
     disarmTimer(self.timer_fd);
     disarmTimer(self.macro_timer_fd);
     disarmTimer(self.rumble_stop_fd);
+    disarmTimer(self.rumble_max_duration_fd);
     self.rumble_scheduler = .{};
     self.last_rumble_ns = 0;
+    self.last_nonzero_rumble_ns = 0;
+    self.rumble_is_active = false;
     if (dcfg) |cfg| {
         _ = emitRumbleFrame(devices, alloc, cfg, 0, 0, tag);
     }
@@ -373,9 +387,16 @@ pub const EventLoop = struct {
     /// Passed to `Mapper.init` so `TimerQueue` arms only this fd, keeping
     /// it independent from the layer-hold `timer_fd`.
     macro_timer_fd: posix.fd_t,
+    /// Dedicated timerfd for max rumble duration safety check (slot 5).
+    /// Fires every second to check if rumble has been active too long.
+    rumble_max_duration_fd: posix.fd_t,
     /// State machine that tracks per-effect deadlines and decides when
     /// to fire a stop frame. See src/core/rumble_scheduler.zig.
     rumble_scheduler: RumbleScheduler,
+    /// Tracks when non-zero rumble was last emitted for max duration check.
+    last_nonzero_rumble_ns: i128 = 0,
+    /// Whether rumble is currently active (non-zero values sent to device).
+    rumble_is_active: bool = false,
     uinput_ff_slot: ?usize,
     /// Slot for the primary UHID fd polled for UHID_OUTPUT events.
     uhid_output_slot: ?usize,
@@ -425,6 +446,9 @@ pub const EventLoop = struct {
         const macro_timer_fd = try posix.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
         errdefer posix.close(macro_timer_fd);
 
+        const rumble_max_duration_fd = try posix.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+        errdefer posix.close(rumble_max_duration_fd);
+
         var loop = EventLoop{
             .pollfds = undefined,
             .fd_count = 0,
@@ -437,6 +461,7 @@ pub const EventLoop = struct {
             .rumble_stop_fd = rumble_stop_fd,
             .rumble_scheduler = .{},
             .macro_timer_fd = macro_timer_fd,
+            .rumble_max_duration_fd = rumble_max_duration_fd,
             .uinput_ff_slot = null,
             .uhid_output_slot = null,
             .disconnected = false,
@@ -451,6 +476,7 @@ pub const EventLoop = struct {
         loop.pollfds[Slots.layer_timer] = .{ .fd = timer_fd, .events = posix.POLL.IN, .revents = 0 };
         loop.pollfds[Slots.rumble_stop] = .{ .fd = rumble_stop_fd, .events = posix.POLL.IN, .revents = 0 };
         loop.pollfds[Slots.macro_timer] = .{ .fd = macro_timer_fd, .events = posix.POLL.IN, .revents = 0 };
+        loop.pollfds[Slots.rumble_max_duration] = .{ .fd = rumble_max_duration_fd, .events = posix.POLL.IN, .revents = 0 };
         loop.fd_count = FIXED_SLOT_COUNT;
         loop.device_base = Slots.device_base;
 
@@ -578,6 +604,8 @@ pub const EventLoop = struct {
                     });
                 }
                 if (result.emit_stop_frame) {
+                    self.rumble_is_active = false;
+                    disarmTimer(self.rumble_max_duration_fd);
                     if (ctx.allocator) |alloc| {
                         if (ctx.device_config) |dcfg| {
                             if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
@@ -587,6 +615,38 @@ pub const EventLoop = struct {
                     }
                 }
                 armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
+            }
+
+            // Check rumble max duration timerfd (slot 5).
+            // This fires every second to check if rumble has been active too long.
+            if (self.pollfds[Slots.rumble_max_duration].revents & posix.POLL.IN != 0) {
+                var rmd_expiry: [8]u8 = undefined;
+                _ = posix.read(self.rumble_max_duration_fd, &rmd_expiry) catch {};
+                const now_ns = monotonicNs();
+
+                // Check if rumble has been active longer than the max duration.
+                // This is a defensive measure against game bugs that don't stop rumble,
+                // or infinite-duration effects that the scheduler can't auto-stop.
+                const max_duration_ms = maxRumbleDurationMs(ctx.device_config);
+                if (max_duration_ms > 0 and self.rumble_is_active) {
+                    const elapsed_ms = @divFloor(now_ns - self.last_nonzero_rumble_ns, std.time.ns_per_ms);
+                    if (elapsed_ms >= max_duration_ms) {
+                        rumble_log.warn("[{s}] MAX_DURATION: rumble active for {d}ms exceeds limit {d}ms, forcing stop", .{
+                            ctx.device_tag, elapsed_ms, max_duration_ms,
+                        });
+                        // Clear all scheduler slots and emit stop frame.
+                        self.rumble_scheduler = .{};
+                        self.rumble_is_active = false;
+                        armRumbleStopFd(self.rumble_stop_fd, null);
+                        if (ctx.allocator) |alloc| {
+                            if (ctx.device_config) |dcfg| {
+                                if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
+                                    rumble_log.debug("[{s}] MAX_DURATION: stop frame FAILED to emit", .{ctx.device_tag});
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Check uinput FF fd.
@@ -618,6 +678,7 @@ pub const EventLoop = struct {
                                     });
                                 }
                                 if (result.emit_stop_frame) {
+                                    self.rumble_is_active = false;
                                     if (ctx.allocator) |alloc| {
                                         if (ctx.device_config) |dcfg| {
                                             if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
@@ -628,6 +689,7 @@ pub const EventLoop = struct {
                                 }
                                 armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
                             } else {
+                                self.rumble_is_active = false;
                                 rumble_log.debug("[{s}] FF_STOP: auto_stop disabled, direct zero frame", .{ctx.device_tag});
                                 if (ctx.allocator) |alloc| {
                                     if (ctx.device_config) |dcfg| {
@@ -647,6 +709,23 @@ pub const EventLoop = struct {
                                         if (emitRumbleFrame(ctx.devices, alloc, dcfg, ff_ev.strong, ff_ev.weak, ctx.device_tag)) {
                                             self.last_rumble_ns = now_ns;
                                             forwarded = true;
+                                            // Track when rumble was last active for max duration check.
+                                            if (ff_ev.strong > 0 or ff_ev.weak > 0) {
+                                                self.last_nonzero_rumble_ns = now_ns;
+                                                if (!self.rumble_is_active) {
+                                                    // Transition from inactive to active: start max duration timer.
+                                                    self.rumble_is_active = true;
+                                                    const max_ms = maxRumbleDurationMs(ctx.device_config);
+                                                    if (max_ms > 0) {
+                                                        // Fire every second while rumble is active.
+                                                        const spec = linux.itimerspec{
+                                                            .it_value = .{ .sec = 1, .nsec = 0 },
+                                                            .it_interval = .{ .sec = 1, .nsec = 0 },
+                                                        };
+                                                        _ = linux.timerfd_settime(self.rumble_max_duration_fd, .{}, &spec, null);
+                                                    }
+                                                }
+                                            }
                                         } else {
                                             rumble_log.debug("[{s}] FF_PLAY: emitRumbleFrame FAILED id={d}", .{ ctx.device_tag, ff_ev.effect_id });
                                         }
@@ -866,6 +945,7 @@ pub const EventLoop = struct {
         posix.close(self.timer_fd);
         posix.close(self.rumble_stop_fd);
         posix.close(self.macro_timer_fd);
+        posix.close(self.rumble_max_duration_fd);
     }
 };
 
