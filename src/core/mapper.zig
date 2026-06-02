@@ -175,6 +175,12 @@ pub const Mapper = struct {
     // Gamepad bits held by an active gesture hold leg; re-asserted each frame
     // until the hold leg emits its release.
     gesture_held_gamepad: u64,
+    // Gamepad bits held by the active layer's `hold` passthrough output;
+    // re-asserted each frame while the layer is ACTIVE.
+    layer_held_gamepad: u64,
+    // Active key/mouse `hold` output: emitted as a .press edge when the layer
+    // goes ACTIVE, matched by a .release on every deactivation path.
+    layer_hold_aux_down: ?AuxDownTarget,
     timer_fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
     active_macros: std.ArrayList(MacroPlayer),
@@ -182,6 +188,9 @@ pub const Mapper = struct {
     next_token: u32,
     resolved_base: ResolvedRemap,
     resolved_layers: []ResolvedRemap,
+    // Pre-resolved `hold` passthrough target per layer (null = no hold output),
+    // parallel to resolved_layers.
+    resolved_layer_holds: []?RemapTargetResolved,
     // In-controller mapping switch via chord detection. null disables the feature.
     chord_detector: ?ChordDetector = null,
 
@@ -207,6 +216,12 @@ pub const Mapper = struct {
             initialized = i + 1;
         }
 
+        const resolved_layer_holds = try allocator.alloc(?RemapTargetResolved, layers.len);
+        errdefer allocator.free(resolved_layer_holds);
+        for (layers, 0..) |*lc, i| {
+            resolved_layer_holds[i] = if (lc.hold) |h| try resolveLayerHold(h) else null;
+        }
+
         return .{
             .config = config,
             .layer = LayerState.init(allocator),
@@ -227,6 +242,8 @@ pub const Mapper = struct {
             .gesture_tokens = .{},
             .gesture_timer_tap_pending = 0,
             .gesture_held_gamepad = 0,
+            .layer_held_gamepad = 0,
+            .layer_hold_aux_down = null,
             .timer_fd = timer_fd,
             .allocator = allocator,
             .active_macros = .{},
@@ -234,6 +251,7 @@ pub const Mapper = struct {
             .next_token = 1,
             .resolved_base = base,
             .resolved_layers = resolved_layers,
+            .resolved_layer_holds = resolved_layer_holds,
         };
     }
 
@@ -246,6 +264,7 @@ pub const Mapper = struct {
         freeResolvedRemap(self.allocator, self.resolved_base);
         for (self.resolved_layers) |r| freeResolvedRemap(self.allocator, r);
         self.allocator.free(self.resolved_layers);
+        self.allocator.free(self.resolved_layer_holds);
     }
 
     pub fn setChordDetector(self: *Mapper, cfg: ChordDetectorConfig) void {
@@ -280,6 +299,9 @@ pub const Mapper = struct {
         self.gesture_tokens.clear();
         self.gesture_timer_tap_pending = 0;
         self.gesture_held_gamepad = 0;
+        // callers must releaseMapperAux first; this only clears state, no release edge.
+        self.layer_held_gamepad = 0;
+        self.layer_hold_aux_down = null;
         self.active_macros.clearRetainingCapacity();
         self.timer_queue.clear();
         self.next_token = 1;
@@ -313,6 +335,11 @@ pub const Mapper = struct {
                 target.* = null;
             }
         }
+        if (self.layer_hold_aux_down) |down| {
+            emitAuxDownRelease(down, &aux);
+            self.layer_hold_aux_down = null;
+        }
+        self.layer_held_gamepad = 0;
 
         var injected: u64 = 0;
         for (self.active_macros.items) |*player| {
@@ -569,6 +596,9 @@ pub const Mapper = struct {
         // emits press once, so the bit must persist across frames until release.
         self.injected_buttons |= self.gesture_held_gamepad;
 
+        // Re-assert the active layer's `hold` passthrough gamepad bit each frame.
+        self.injected_buttons |= self.layer_held_gamepad;
+
         if (action.tap_event) |tap| {
             emitTapEvent(self, tap, &aux, now_ns);
         }
@@ -688,6 +718,12 @@ pub const Mapper = struct {
         } else if (th_res.layer_activated) {
             self.prev.dpad_x = 0;
             self.prev.dpad_y = 0;
+            // Plain hold activation has no active_changed apply() chokepoint, so
+            // drive the `hold` passthrough here. updateLayerHold releases the
+            // prior layer's hold first, so it must run even when the newly-active
+            // layer has no hold target — otherwise a stale hold leaks forever.
+            self.updateLayerHold(&events.aux);
+            events.gamepad = self.currentMappedGamepadFrame();
         }
         return events;
     }
@@ -739,12 +775,51 @@ pub const Mapper = struct {
         self.gesture_engine.reset();
         self.gesture_timer_tap_pending = 0;
         self.gesture_held_gamepad = 0;
+        self.updateLayerHold(aux);
+    }
+
+    // Single chokepoint for the layer `hold` passthrough output. Releases the
+    // previously-held key/mouse output, then re-asserts the now-active layer's
+    // hold target. Gamepad hold bits live in layer_held_gamepad (re-asserted
+    // every frame); key/mouse holds emit explicit press/release edges here.
+    fn updateLayerHold(self: *Mapper, aux: *AuxEventList) void {
+        const configs = self.config.layer orelse &.{};
+        const next_target: ?RemapTargetResolved = blk: {
+            const idx = self.layer.getActiveIndex(configs) orelse break :blk null;
+            break :blk self.resolved_layer_holds[idx];
+        };
+        const next_aux = if (next_target) |target| auxDownTarget(target) else null;
+
+        if (self.layer_hold_aux_down) |down| {
+            if (next_aux) |wanted| {
+                if (auxDownTargetEql(down, wanted)) {
+                    // Same held aux across the switch — leave it pressed, no flicker.
+                    self.layer_held_gamepad = 0;
+                    return;
+                }
+            }
+            emitAuxDownRelease(down, aux);
+            self.layer_hold_aux_down = null;
+        }
+        self.layer_held_gamepad = 0;
+
+        const target = next_target orelse return;
+        switch (target) {
+            .gamepad_button => |dst| {
+                self.layer_held_gamepad = @as(u64, 1) << @as(u6, @intCast(@intFromEnum(dst)));
+            },
+            .key, .mouse_button => {
+                remap_mod.applyTarget(target, .press, aux, &self.injected_buttons, null, null);
+                self.layer_hold_aux_down = auxDownTarget(target);
+            },
+            else => {},
+        }
     }
 
     fn currentMappedGamepadFrame(self: *Mapper) GamepadState {
         const configs = self.config.layer orelse &.{};
         var suppressed: u64 = 0;
-        var injected: u64 = self.gesture_held_gamepad;
+        var injected: u64 = self.gesture_held_gamepad | self.layer_held_gamepad;
         var per_src_inject: [BUTTON_COUNT]?RemapTargetResolved = [_]?RemapTargetResolved{null} ** BUTTON_COUNT;
 
         for (self.active_macros.items) |player| {
@@ -1182,6 +1257,11 @@ fn precomputeRemap(allocator: std.mem.Allocator, remap_map: mapping.RemapMap) !R
 fn buttonBit(name: []const u8) u64 {
     const id = std.meta.stringToEnum(ButtonId, name) orelse return 0;
     return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(id)));
+}
+
+fn resolveLayerHold(raw: []const u8) !RemapTargetResolved {
+    if (std.mem.startsWith(u8, raw, "macro:")) return error.LayerHoldCannotBeMacro;
+    return resolveTarget(raw);
 }
 
 fn checkGyroActivate(activate: ?[]const u8, buttons: u64) bool {
@@ -1796,6 +1876,531 @@ test "mapper: hold_toggle timer frame preserves chord selector suppression" {
     try testing.expect((timer_events.gamepad.?.buttons & rm_mask) != 0);
 }
 
+// --- layer `hold` passthrough output ---
+
+fn auxHasKey(aux: *const AuxEventList, code: u16, pressed: bool) bool {
+    for (aux.slice()) |ev| {
+        switch (ev) {
+            .key => |k| if (k.code == code and k.pressed == pressed) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn auxCountKey(aux: *const AuxEventList, code: u16, pressed: bool) usize {
+    var n: usize = 0;
+    for (aux.slice()) |ev| {
+        switch (ev) {
+            .key => |k| if (k.code == code and k.pressed == pressed) {
+                n += 1;
+            },
+            else => {},
+        }
+    }
+    return n;
+}
+
+test "mapper: layer hold gamepad: bit present every frame while ACTIVE, gone on release" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "sense"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\hold = "RB"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const lb_mask = buttonBit("LB");
+    const rb_mask = buttonBit("RB");
+
+    // Press trigger -> PENDING: no hold output yet.
+    const ev_pending = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    try testing.expectEqual(@as(u64, 0), ev_pending.gamepad.buttons & rb_mask);
+
+    // Timer fires -> ACTIVE: hold gamepad frame asserts the bit.
+    const timer = m.onLayerTimerExpiredAt(210_000_000);
+    try testing.expect(timer.gamepad != null);
+    try testing.expect((timer.gamepad.?.buttons & rb_mask) != 0);
+
+    // Bit re-asserted on every subsequent frame while held.
+    const ev1 = try m.apply(.{ .buttons = lb_mask }, 16, 220_000_000);
+    try testing.expect((ev1.gamepad.buttons & rb_mask) != 0);
+    const ev2 = try m.apply(.{ .buttons = lb_mask }, 16, 230_000_000);
+    try testing.expect((ev2.gamepad.buttons & rb_mask) != 0);
+
+    // Release -> bit gone.
+    const ev_release = try m.apply(.{ .buttons = 0 }, 16, 500_000_000);
+    try testing.expectEqual(@as(u64, 0), ev_release.gamepad.buttons & rb_mask);
+}
+
+test "mapper: layer hold key: exactly one press on activation, one release on deactivation, no dup mid-hold" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "sense"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\hold = "KEY_LEFTSHIFT"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const shift = try @import("../config/input_codes.zig").resolveKeyCode("KEY_LEFTSHIFT");
+    const lb_mask = buttonBit("LB");
+
+    // PENDING: no hold key press.
+    const ev_pending = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    try testing.expect(!auxHasKey(&ev_pending.aux, shift, true));
+
+    // ACTIVE: exactly one press edge.
+    const timer = m.onLayerTimerExpiredAt(210_000_000);
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&timer.aux, shift, true));
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&timer.aux, shift, false));
+
+    // No duplicate press across held frames.
+    const ev1 = try m.apply(.{ .buttons = lb_mask }, 16, 220_000_000);
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&ev1.aux, shift, true));
+    const ev2 = try m.apply(.{ .buttons = lb_mask }, 16, 230_000_000);
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&ev2.aux, shift, true));
+
+    // Release: exactly one release edge.
+    const ev_release = try m.apply(.{ .buttons = 0 }, 16, 500_000_000);
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&ev_release.aux, shift, false));
+    try testing.expect(m.layer_hold_aux_down == null);
+}
+
+test "mapper: layer hold: short tap emits no hold output" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "sense"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\tap = "KEY_F13"
+        \\hold = "KEY_LEFTSHIFT"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const shift = try @import("../config/input_codes.zig").resolveKeyCode("KEY_LEFTSHIFT");
+    const f13 = try @import("../config/input_codes.zig").resolveKeyCode("KEY_F13");
+    const lb_mask = buttonBit("LB");
+
+    // Press then release before the timer fires -> tap, no hold.
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    const ev_tap = try m.apply(.{ .buttons = 0 }, 16, 100_000_000);
+
+    try testing.expect(auxHasKey(&ev_tap.aux, f13, true));
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&ev_tap.aux, shift, true));
+    try testing.expect(m.layer_hold_aux_down == null);
+    try testing.expectEqual(@as(u64, 0), m.layer_held_gamepad);
+}
+
+test "mapper: layer hold_toggle gamepad: present while sticky-on, released on sticky-off" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "race"
+        \\trigger = "LB"
+        \\activation = "hold_toggle"
+        \\hold = "RB"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const lb_mask = buttonBit("LB");
+    const rb_mask = buttonBit("RB");
+
+    // Hold past timeout toggles sticky ON.
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    const on = m.onLayerTimerExpiredAt(210_000_000);
+    try testing.expect(on.gamepad != null);
+    try testing.expect((on.gamepad.?.buttons & rb_mask) != 0);
+    try testing.expect(m.layer.toggled.contains("race"));
+
+    // Release trigger, layer stays on -> hold bit still re-asserted.
+    const ev_after = try m.apply(.{ .buttons = 0 }, 16, 250_000_000);
+    try testing.expect((ev_after.gamepad.buttons & rb_mask) != 0);
+
+    // Hold again toggles sticky OFF -> bit gone.
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 300_000_000);
+    const off = m.onLayerTimerExpiredAt(520_000_000);
+    try testing.expect(off.gamepad != null);
+    try testing.expectEqual(@as(u64, 0), off.gamepad.?.buttons & rb_mask);
+    try testing.expectEqual(@as(u64, 0), m.layer_held_gamepad);
+}
+
+test "mapper: layer toggle gamepad hold: present while latched-on, released on toggle-off" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "fn"
+        \\trigger = "Select"
+        \\activation = "toggle"
+        \\hold = "RB"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const sel_mask = buttonBit("Select");
+    const rb_mask = buttonBit("RB");
+
+    // Toggle on (press+release of Select).
+    _ = try m.apply(.{ .buttons = sel_mask }, 16, 0);
+    const ev_on = try m.apply(.{ .buttons = 0 }, 16, 16_000_000);
+    try testing.expect(m.layer.toggled.contains("fn"));
+    try testing.expect((ev_on.gamepad.buttons & rb_mask) != 0);
+
+    // Still latched -> bit re-asserted.
+    const ev_held = try m.apply(.{ .buttons = 0 }, 16, 32_000_000);
+    try testing.expect((ev_held.gamepad.buttons & rb_mask) != 0);
+
+    // Toggle off.
+    _ = try m.apply(.{ .buttons = sel_mask }, 16, 48_000_000);
+    const ev_off = try m.apply(.{ .buttons = 0 }, 16, 64_000_000);
+    try testing.expect(!m.layer.toggled.contains("fn"));
+    try testing.expectEqual(@as(u64, 0), ev_off.gamepad.buttons & rb_mask);
+}
+
+test "mapper: layer hold key: same-target A->B switch keeps key held with no flicker" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "a"
+        \\trigger = "LB"
+        \\activation = "toggle"
+        \\hold = "KEY_LEFTSHIFT"
+        \\[[layer]]
+        \\name = "b"
+        \\trigger = "RB"
+        \\activation = "toggle"
+        \\hold = "KEY_LEFTSHIFT"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const shift = try @import("../config/input_codes.zig").resolveKeyCode("KEY_LEFTSHIFT");
+    const lb_mask = buttonBit("LB");
+    const rb_mask = buttonBit("RB");
+
+    // Toggle A on: exactly one SHIFT press, no release.
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    const ev_on = try m.apply(.{ .buttons = 0 }, 16, 16_000_000);
+    try testing.expect(m.layer.toggled.contains("a"));
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&ev_on.aux, shift, true));
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&ev_on.aux, shift, false));
+
+    // Atomic A->B handoff: both triggers release in one frame. A toggles off,
+    // B toggles on. Both layers hold SHIFT, so the key must stay held: no
+    // release edge and no duplicate press across the switch.
+    _ = try m.apply(.{ .buttons = lb_mask | rb_mask }, 16, 32_000_000);
+    const ev_switch = try m.apply(.{ .buttons = 0 }, 16, 48_000_000);
+    try testing.expect(!m.layer.toggled.contains("a"));
+    try testing.expect(m.layer.toggled.contains("b"));
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&ev_switch.aux, shift, false));
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&ev_switch.aux, shift, true));
+    try testing.expect(m.layer_hold_aux_down != null);
+
+    // Deactivate B: exactly one SHIFT release.
+    _ = try m.apply(.{ .buttons = rb_mask }, 16, 64_000_000);
+    const ev_off = try m.apply(.{ .buttons = 0 }, 16, 80_000_000);
+    try testing.expect(!m.layer.toggled.contains("b"));
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&ev_off.aux, shift, false));
+    try testing.expect(m.layer_hold_aux_down == null);
+}
+
+test "mapper: layer hold key: different-target A->B switch releases old key and presses new" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "a"
+        \\trigger = "LB"
+        \\activation = "toggle"
+        \\hold = "KEY_LEFTSHIFT"
+        \\[[layer]]
+        \\name = "b"
+        \\trigger = "RB"
+        \\activation = "toggle"
+        \\hold = "KEY_LEFTCTRL"
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const shift = try @import("../config/input_codes.zig").resolveKeyCode("KEY_LEFTSHIFT");
+    const ctrl = try @import("../config/input_codes.zig").resolveKeyCode("KEY_LEFTCTRL");
+    const lb_mask = buttonBit("LB");
+    const rb_mask = buttonBit("RB");
+
+    // Toggle A on: one SHIFT press.
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    const ev_on = try m.apply(.{ .buttons = 0 }, 16, 16_000_000);
+    try testing.expect(m.layer.toggled.contains("a"));
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&ev_on.aux, shift, true));
+
+    // Atomic A->B handoff with different targets: exactly one SHIFT release and
+    // one CTRL press on the same frame.
+    _ = try m.apply(.{ .buttons = lb_mask | rb_mask }, 16, 32_000_000);
+    const ev_switch = try m.apply(.{ .buttons = 0 }, 16, 48_000_000);
+    try testing.expect(!m.layer.toggled.contains("a"));
+    try testing.expect(m.layer.toggled.contains("b"));
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&ev_switch.aux, shift, false));
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&ev_switch.aux, ctrl, true));
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&ev_switch.aux, shift, true));
+    try testing.expectEqual(@as(usize, 0), auxCountKey(&ev_switch.aux, ctrl, false));
+}
+
+test "mapper: layer hold key released on mapping switch (releaseHeldAux)" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "sense"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\hold = "KEY_LEFTSHIFT"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const shift = try @import("../config/input_codes.zig").resolveKeyCode("KEY_LEFTSHIFT");
+    const lb_mask = buttonBit("LB");
+
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    _ = m.onLayerTimerExpiredAt(210_000_000);
+    try testing.expect(m.layer_hold_aux_down != null);
+
+    // Mapping/profile switch releases everything held.
+    const release = m.releaseHeldAux();
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&release, shift, false));
+    try testing.expect(m.layer_hold_aux_down == null);
+    try testing.expectEqual(@as(u64, 0), m.layer_held_gamepad);
+}
+
+test "mapper: layer hold state cleared by resetRuntimeState" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "sense"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\hold = "KEY_LEFTSHIFT"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const lb_mask = buttonBit("LB");
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    _ = m.onLayerTimerExpiredAt(210_000_000);
+    m.layer_held_gamepad = buttonBit("RB");
+    try testing.expect(m.layer_hold_aux_down != null);
+
+    m.resetRuntimeState();
+    try testing.expect(m.layer_hold_aux_down == null);
+    try testing.expectEqual(@as(u64, 0), m.layer_held_gamepad);
+}
+
+test "mapper: layer hold == trigger name nets single clean press" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "sense"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\hold = "LB"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const lb_mask = buttonBit("LB");
+
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    _ = m.onLayerTimerExpiredAt(210_000_000);
+
+    // LB is force-suppressed as a trigger, but the hold inject re-emits it.
+    // `(state & ~suppressed) | injected` must net the bit set (not cancelled).
+    const ev = try m.apply(.{ .buttons = lb_mask }, 16, 220_000_000);
+    try testing.expect((ev.gamepad.buttons & lb_mask) != 0);
+    // Clean: a gamepad hold produces NO aux key/mouse traffic on this frame.
+    try testing.expectEqual(@as(usize, 0), ev.aux.len);
+
+    // Still held next frame -> bit stays set, no spurious release.
+    const ev_next = try m.apply(.{ .buttons = lb_mask }, 16, 230_000_000);
+    try testing.expect((ev_next.gamepad.buttons & lb_mask) != 0);
+    try testing.expectEqual(@as(usize, 0), ev_next.aux.len);
+}
+
+test "mutation guard: layer hold gamepad re-assert must be killable" {
+    // Mutation audit: deleting `self.injected_buttons |= self.layer_held_gamepad;`
+    // in apply() makes the every-frame assertion below fail.
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "sense"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\hold = "RB"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const lb_mask = buttonBit("LB");
+    const rb_mask = buttonBit("RB");
+
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    _ = m.onLayerTimerExpiredAt(210_000_000);
+
+    const ev = try m.apply(.{ .buttons = lb_mask }, 16, 220_000_000);
+    try testing.expect((ev.gamepad.buttons & rb_mask) != 0);
+}
+
+test "mapper: switching to a hold layer without a hold releases the prior layer's gamepad hold" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "toggle_hold"
+        \\trigger = "Select"
+        \\activation = "toggle"
+        \\hold = "RB"
+        \\
+        \\[[layer]]
+        \\name = "plain"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const sel_mask = buttonBit("Select");
+    const lb_mask = buttonBit("LB");
+    const rb_mask = buttonBit("RB");
+
+    // Toggle layer A on -> RB asserted.
+    _ = try m.apply(.{ .buttons = sel_mask }, 16, 0);
+    const ev_on = try m.apply(.{ .buttons = 0 }, 16, 16_000_000);
+    try testing.expect((ev_on.gamepad.buttons & rb_mask) != 0);
+
+    // Activate plain-hold layer B on top (A->B flip). B has no hold target,
+    // so A's RB must be released, not left re-asserted forever.
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 32_000_000);
+    const on_b = m.onLayerTimerExpiredAt(242_000_000);
+    try testing.expect(on_b.gamepad != null);
+    try testing.expectEqual(@as(u64, 0), on_b.gamepad.?.buttons & rb_mask);
+    try testing.expectEqual(@as(u64, 0), m.layer_held_gamepad);
+
+    // While B is active, apply() must not re-assert RB.
+    const held_b = try m.apply(.{ .buttons = lb_mask }, 16, 258_000_000);
+    try testing.expectEqual(@as(u64, 0), held_b.gamepad.buttons & rb_mask);
+
+    // Release LB -> B deactivates, A is active again -> RB returns.
+    const off_b = try m.apply(.{ .buttons = 0 }, 16, 274_000_000);
+    try testing.expect((off_b.gamepad.buttons & rb_mask) != 0);
+    try testing.expect((m.layer_held_gamepad & rb_mask) != 0);
+}
+
+test "mapper: switching to a hold layer without a hold releases the prior layer's key hold" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "toggle_hold"
+        \\trigger = "Select"
+        \\activation = "toggle"
+        \\hold = "KEY_LEFTSHIFT"
+        \\
+        \\[[layer]]
+        \\name = "plain"
+        \\trigger = "LB"
+        \\activation = "hold"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const shift = try @import("../config/input_codes.zig").resolveKeyCode("KEY_LEFTSHIFT");
+    const sel_mask = buttonBit("Select");
+    const lb_mask = buttonBit("LB");
+
+    // Toggle layer A on -> SHIFT pressed.
+    _ = try m.apply(.{ .buttons = sel_mask }, 16, 0);
+    const ev_on = try m.apply(.{ .buttons = 0 }, 16, 16_000_000);
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&ev_on.aux, shift, true));
+    try testing.expect(m.layer_hold_aux_down != null);
+
+    // Activate plain-hold layer B (A->B flip) -> SHIFT must be released.
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 32_000_000);
+    const on_b = m.onLayerTimerExpiredAt(242_000_000);
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&on_b.aux, shift, false));
+    try testing.expect(m.layer_hold_aux_down == null);
+
+    // Release LB -> A active again -> SHIFT pressed again.
+    const off_b = try m.apply(.{ .buttons = 0 }, 16, 258_000_000);
+    try testing.expectEqual(@as(usize, 1), auxCountKey(&off_b.aux, shift, true));
+    try testing.expect(m.layer_hold_aux_down != null);
+}
+
+test "mapper: hold == trigger via timer-expiry frame nets the bit set" {
+    // currentMappedGamepadFrame() must apply suppression before injection so the
+    // hold re-emit survives: (state & ~suppressed) | injected. A flipped order
+    // (state | injected) & ~suppressed would mask the LB hold away here.
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[[layer]]
+        \\name = "sense"
+        \\trigger = "LB"
+        \\activation = "hold_toggle"
+        \\hold = "LB"
+        \\hold_timeout = 200
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const lb_mask = buttonBit("LB");
+
+    // Hold past timeout -> sticky activation drives currentMappedGamepadFrame().
+    _ = try m.apply(.{ .buttons = lb_mask }, 16, 0);
+    const on = m.onLayerTimerExpiredAt(210_000_000);
+    try testing.expect(on.gamepad != null);
+    try testing.expect((on.gamepad.?.buttons & lb_mask) != 0);
+}
+
 test "mapper: layer gyro override: active layer gyro config used" {
     const allocator = testing.allocator;
     const parsed = try makeMapping(
@@ -2177,8 +2782,9 @@ test "mapper: Mapper.apply toggle OOM is silently swallowed" {
         \\activation = "toggle"
     , allocator);
     defer parsed.deinit();
-    // Failing allocator: Mapper.init needs 1 alloc (resolved_layers); second alloc fails on toggled.put.
-    var fa = testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    // Failing allocator: Mapper.init needs 2 allocs (resolved_layers +
+    // resolved_layer_holds); third alloc fails on toggled.put.
+    var fa = testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
     var m = try Mapper.init(&parsed.value, std.posix.STDIN_FILENO, fa.allocator());
     defer m.deinit();
     const sel_idx: u6 = @intCast(@intFromEnum(ButtonId.Select));
