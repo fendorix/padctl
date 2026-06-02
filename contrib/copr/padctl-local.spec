@@ -9,8 +9,8 @@
 #   1. Extract Zig 0.15.2 somewhere, e.g. /opt/zig-0.15.2/zig
 #
 #   2. Create a source tarball from the repo root:
-#        git archive --format=tar.gz --prefix=padctl-0.1.7/ HEAD \
-#          -o ~/rpmbuild/SOURCES/padctl-0.1.7.tar.gz
+#        git archive --format=tar.gz --prefix=padctl-0.1.13/ HEAD \
+#          -o ~/rpmbuild/SOURCES/padctl-0.1.13.tar.gz
 #
 #   3. Build the RPM (point to the working Zig):
 #        rpmbuild -bb contrib/copr/padctl-local.spec \
@@ -23,7 +23,7 @@
 %define debug_package %{nil}
 
 Name:           padctl
-Version:        0.1.12
+Version:        0.1.13
 Release:        1%{?dist}
 Summary:        HID gamepad remapper with declarative TOML config
 
