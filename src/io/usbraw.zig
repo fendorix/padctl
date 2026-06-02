@@ -101,11 +101,13 @@ pub const UsbrawDevice = struct {
 
         const rc = c.libusb_claim_interface(handle, interface_id);
         if (rc == c.LIBUSB_ERROR_BUSY) {
+            _ = c.libusb_attach_kernel_driver(handle, interface_id);
             c.libusb_close(handle);
             c.libusb_exit(ctx);
             return error.Busy;
         }
         if (rc != 0) {
+            _ = c.libusb_attach_kernel_driver(handle, interface_id);
             c.libusb_close(handle);
             c.libusb_exit(ctx);
             return error.ClaimFailed;
@@ -140,6 +142,16 @@ pub const UsbrawDevice = struct {
         return self;
     }
 
+    fn closeWriteEnd(self: *UsbrawDevice) void {
+        const fd = @atomicRmw(std.posix.fd_t, &self.pipe_w, .Xchg, -1, .acq_rel);
+        if (fd >= 0) std.posix.close(fd);
+    }
+
+    fn signalDisconnect(self: *UsbrawDevice) void {
+        self.disconnected.store(true, .release);
+        self.closeWriteEnd();
+    }
+
     fn readLoop(self: *UsbrawDevice) void {
         var buf: [RingBuffer.SLOT_SIZE]u8 = undefined;
         var transferred: c_int = 0;
@@ -155,8 +167,7 @@ pub const UsbrawDevice = struct {
             );
 
             if (rc == c.LIBUSB_ERROR_NO_DEVICE) {
-                self.disconnected.store(true, .release);
-                _ = std.posix.write(self.pipe_w, "\x01") catch {};
+                self.signalDisconnect();
                 break;
             }
 
@@ -223,9 +234,72 @@ pub const UsbrawDevice = struct {
         const self: *UsbrawDevice = @ptrCast(@alignCast(ptr));
         self.should_stop.store(true, .release);
         self.thread.join();
-        std.posix.close(self.pipe_w);
+        self.closeWriteEnd();
         std.posix.close(self.pipe_r);
         _ = c.libusb_release_interface(self.handle, self.interface_id);
+        _ = c.libusb_attach_kernel_driver(self.handle, self.interface_id);
+        c.libusb_close(self.handle);
+        c.libusb_exit(self.ctx);
+        self.allocator.destroy(self);
+    }
+};
+
+// Claims an interface purely to evict the kernel driver, so the device
+// exposes no hidraw/evdev node for it. No reads, no writes, no poll fd.
+pub const UsbrawSuppress = struct {
+    handle: *c.libusb_device_handle,
+    ctx: *c.libusb_context,
+    interface_id: i32,
+    allocator: std.mem.Allocator,
+
+    pub fn openSuppress(
+        alloc: std.mem.Allocator,
+        vid: u16,
+        pid: u16,
+        interface_id: u8,
+    ) !*UsbrawSuppress {
+        var ctx: ?*c.libusb_context = null;
+        if (c.libusb_init(&ctx) != 0) return error.LibusbInit;
+
+        const handle = c.libusb_open_device_with_vid_pid(ctx, vid, pid) orelse {
+            c.libusb_exit(ctx);
+            return error.NotFound;
+        };
+
+        _ = c.libusb_detach_kernel_driver(handle, interface_id);
+
+        const rc = c.libusb_claim_interface(handle, interface_id);
+        if (rc == c.LIBUSB_ERROR_BUSY) {
+            _ = c.libusb_attach_kernel_driver(handle, interface_id);
+            c.libusb_close(handle);
+            c.libusb_exit(ctx);
+            return error.Busy;
+        }
+        if (rc != 0) {
+            _ = c.libusb_attach_kernel_driver(handle, interface_id);
+            c.libusb_close(handle);
+            c.libusb_exit(ctx);
+            return error.ClaimFailed;
+        }
+
+        const self = alloc.create(UsbrawSuppress) catch |err| {
+            _ = c.libusb_release_interface(handle, interface_id);
+            c.libusb_close(handle);
+            c.libusb_exit(ctx);
+            return err;
+        };
+        self.* = .{
+            .handle = handle,
+            .ctx = ctx.?,
+            .interface_id = @intCast(interface_id),
+            .allocator = alloc,
+        };
+        return self;
+    }
+
+    pub fn close(self: *UsbrawSuppress) void {
+        _ = c.libusb_release_interface(self.handle, self.interface_id);
+        _ = c.libusb_attach_kernel_driver(self.handle, self.interface_id);
         c.libusb_close(self.handle);
         c.libusb_exit(self.ctx);
         self.allocator.destroy(self);
@@ -280,6 +354,26 @@ test "usbraw: RingBuffer wraps around correctly" {
     _ = rb.pop(&out);
     try std.testing.expectEqual(@as(u8, 0xBB), out[0]);
     try std.testing.expectEqual(@as(usize, 0), rb.count);
+}
+
+test "usbraw: signalDisconnect closes write end and raises POLLHUP" {
+    const pipe_fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    var dev: UsbrawDevice = undefined;
+    dev.pipe_r = pipe_fds[0];
+    dev.pipe_w = pipe_fds[1];
+    dev.disconnected = std.atomic.Value(bool).init(false);
+
+    dev.signalDisconnect();
+
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), dev.pipe_w);
+    try std.testing.expect(dev.disconnected.load(.acquire));
+
+    var fds = [_]std.posix.pollfd{.{ .fd = dev.pipe_r, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&fds, 1000);
+    try std.testing.expect(ready == 1);
+    try std.testing.expect(fds[0].revents & std.posix.POLL.HUP != 0);
+
+    std.posix.close(dev.pipe_r);
 }
 
 test "usbraw: RingBuffer concurrent push/pop" {
