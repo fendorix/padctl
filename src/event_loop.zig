@@ -256,7 +256,7 @@ fn quiesceTimersAndRumbleImpl(
     disarmTimer(self.rumble_max_duration_fd);
     self.rumble_scheduler = .{};
     self.last_rumble_ns = 0;
-    self.last_nonzero_rumble_ns = 0;
+    self.rumble_start_ns = 0;
     self.rumble_is_active = false;
     if (dcfg) |cfg| {
         _ = emitRumbleFrame(devices, alloc, cfg, 0, 0, tag);
@@ -393,8 +393,10 @@ pub const EventLoop = struct {
     /// State machine that tracks per-effect deadlines and decides when
     /// to fire a stop frame. See src/core/rumble_scheduler.zig.
     rumble_scheduler: RumbleScheduler,
-    /// Tracks when non-zero rumble was last emitted for max duration check.
-    last_nonzero_rumble_ns: i128 = 0,
+    /// Timestamp when rumble first became active (when rumble_is_active went
+    /// from false to true). Used for max_duration_ms safety cap. NOT updated
+    /// on subsequent play events while rumble is already active.
+    rumble_start_ns: i128 = 0,
     /// Whether rumble is currently active (non-zero values sent to device).
     rumble_is_active: bool = false,
     uinput_ff_slot: ?usize,
@@ -605,6 +607,7 @@ pub const EventLoop = struct {
                 }
                 if (result.emit_stop_frame) {
                     self.rumble_is_active = false;
+                    self.rumble_start_ns = 0;
                     disarmTimer(self.rumble_max_duration_fd);
                     if (ctx.allocator) |alloc| {
                         if (ctx.device_config) |dcfg| {
@@ -628,8 +631,13 @@ pub const EventLoop = struct {
                 // This is a defensive measure against game bugs that don't stop rumble,
                 // or infinite-duration effects that the scheduler can't auto-stop.
                 const max_duration_ms = maxRumbleDurationMs(ctx.device_config);
+                if (padctl_log.shouldWriteToFile(.debug)) {
+                    rumble_log.debug("[{s}] MAX_DURATION_TIMER: active={} start={d} now={d} max_ms={d}", .{
+                        ctx.device_tag, self.rumble_is_active, self.rumble_start_ns, now_ns, max_duration_ms,
+                    });
+                }
                 if (max_duration_ms > 0 and self.rumble_is_active) {
-                    const elapsed_ms = @divFloor(now_ns - self.last_nonzero_rumble_ns, std.time.ns_per_ms);
+                    const elapsed_ms = @divFloor(now_ns - self.rumble_start_ns, std.time.ns_per_ms);
                     if (elapsed_ms >= max_duration_ms) {
                         rumble_log.warn("[{s}] MAX_DURATION: rumble active for {d}ms exceeds limit {d}ms, forcing stop", .{
                             ctx.device_tag, elapsed_ms, max_duration_ms,
@@ -637,7 +645,9 @@ pub const EventLoop = struct {
                         // Clear all scheduler slots and emit stop frame.
                         self.rumble_scheduler = .{};
                         self.rumble_is_active = false;
+                        self.rumble_start_ns = 0;
                         armRumbleStopFd(self.rumble_stop_fd, null);
+                        disarmTimer(self.rumble_max_duration_fd);
                         if (ctx.allocator) |alloc| {
                             if (ctx.device_config) |dcfg| {
                                 if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
@@ -679,6 +689,8 @@ pub const EventLoop = struct {
                                 }
                                 if (result.emit_stop_frame) {
                                     self.rumble_is_active = false;
+                                    self.rumble_start_ns = 0;
+                                    disarmTimer(self.rumble_max_duration_fd);
                                     if (ctx.allocator) |alloc| {
                                         if (ctx.device_config) |dcfg| {
                                             if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
@@ -690,6 +702,8 @@ pub const EventLoop = struct {
                                 armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
                             } else {
                                 self.rumble_is_active = false;
+                                self.rumble_start_ns = 0;
+                                disarmTimer(self.rumble_max_duration_fd);
                                 rumble_log.debug("[{s}] FF_STOP: auto_stop disabled, direct zero frame", .{ctx.device_tag});
                                 if (ctx.allocator) |alloc| {
                                     if (ctx.device_config) |dcfg| {
@@ -701,6 +715,24 @@ pub const EventLoop = struct {
                             }
                         } else {
                             // Play event: throttle applies to play frames.
+                            // Track rumble activity BEFORE throttling check so we don't miss
+                            // the transition from inactive to active when events are throttled.
+                            if (ff_ev.strong > 0 or ff_ev.weak > 0) {
+                                if (!self.rumble_is_active) {
+                                    self.rumble_is_active = true;
+                                    self.rumble_start_ns = now_ns;
+                                    const max_ms = maxRumbleDurationMs(ctx.device_config);
+                                    if (max_ms > 0) {
+                                        // Fire every second while rumble is active.
+                                        const spec = linux.itimerspec{
+                                            .it_value = .{ .sec = 1, .nsec = 0 },
+                                            .it_interval = .{ .sec = 1, .nsec = 0 },
+                                        };
+                                        _ = linux.timerfd_settime(self.rumble_max_duration_fd, .{}, &spec, null);
+                                    }
+                                }
+                            }
+                            
                             var forwarded = false;
                             const elapsed = now_ns - self.last_rumble_ns;
                             if (elapsed >= min_interval_ns) {
@@ -709,23 +741,6 @@ pub const EventLoop = struct {
                                         if (emitRumbleFrame(ctx.devices, alloc, dcfg, ff_ev.strong, ff_ev.weak, ctx.device_tag)) {
                                             self.last_rumble_ns = now_ns;
                                             forwarded = true;
-                                            // Track when rumble was last active for max duration check.
-                                            if (ff_ev.strong > 0 or ff_ev.weak > 0) {
-                                                self.last_nonzero_rumble_ns = now_ns;
-                                                if (!self.rumble_is_active) {
-                                                    // Transition from inactive to active: start max duration timer.
-                                                    self.rumble_is_active = true;
-                                                    const max_ms = maxRumbleDurationMs(ctx.device_config);
-                                                    if (max_ms > 0) {
-                                                        // Fire every second while rumble is active.
-                                                        const spec = linux.itimerspec{
-                                                            .it_value = .{ .sec = 1, .nsec = 0 },
-                                                            .it_interval = .{ .sec = 1, .nsec = 0 },
-                                                        };
-                                                        _ = linux.timerfd_settime(self.rumble_max_duration_fd, .{}, &spec, null);
-                                                    }
-                                                }
-                                            }
                                         } else {
                                             rumble_log.debug("[{s}] FF_PLAY: emitRumbleFrame FAILED id={d}", .{ ctx.device_tag, ff_ev.effect_id });
                                         }
