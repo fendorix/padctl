@@ -606,9 +606,14 @@ pub const EventLoop = struct {
                     });
                 }
                 if (result.emit_stop_frame) {
-                    self.rumble_is_active = false;
-                    self.rumble_start_ns = 0;
-                    disarmTimer(self.rumble_max_duration_fd);
+                    // Emit the stop frame to HID but do NOT reset
+                    // rumble_is_active or disarm rumble_max_duration_fd
+                    // here. The max-duration safety cap must continue
+                    // tracking total rumble activity even across
+                    // consecutive auto-stops, otherwise a game that
+                    // sends rapid overlapping play events resets
+                    // rumble_start_ns on every auto-stop→reactivate
+                    // cycle and the 10s guard never fires.
                     if (ctx.allocator) |alloc| {
                         if (ctx.device_config) |dcfg| {
                             if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
