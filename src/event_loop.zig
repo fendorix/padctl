@@ -641,14 +641,12 @@ pub const EventLoop = struct {
                             }
                         } else {
                             // Play event: throttle applies to play frames.
-                            var forwarded = false;
                             const elapsed = now_ns - self.last_rumble_ns;
                             if (elapsed >= min_interval_ns) {
                                 if (ctx.allocator) |alloc| {
                                     if (ctx.device_config) |dcfg| {
                                         if (emitRumbleFrame(ctx.devices, alloc, dcfg, ff_ev.strong, ff_ev.weak, ctx.device_tag)) {
                                             self.last_rumble_ns = now_ns;
-                                            forwarded = true;
                                         } else {
                                             rumble_log.debug("[{s}] FF_PLAY: emitRumbleFrame FAILED id={d}", .{ ctx.device_tag, ff_ev.effect_id });
                                         }
@@ -660,7 +658,7 @@ pub const EventLoop = struct {
                                     @as(u64, @intCast(@min(elapsed, std.math.maxInt(u64)))),
                                 });
                             }
-                            if (scheduler_on and forwarded) {
+                            if (scheduler_on) {
                                 const next_dl = self.rumble_scheduler.onPlay(
                                     ff_ev.effect_id,
                                     ff_ev.duration_ms,
