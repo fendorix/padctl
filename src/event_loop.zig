@@ -647,18 +647,24 @@ pub const EventLoop = struct {
                         rumble_log.warn("[{s}] MAX_DURATION: rumble active for {d}ms exceeds limit {d}ms, forcing stop", .{
                             ctx.device_tag, elapsed_ms, max_duration_ms,
                         });
-                        // Clear all scheduler slots and emit stop frame.
+                        // Clear scheduler slots so we stop tracking effects,
+                        // and disarm the auto-stop timerfd.
                         self.rumble_scheduler = .{};
-                        self.rumble_is_active = false;
-                        self.rumble_start_ns = 0;
                         armRumbleStopFd(self.rumble_stop_fd, null);
-                        disarmTimer(self.rumble_max_duration_fd);
+                        var stop_sent = false;
                         if (ctx.allocator) |alloc| {
                             if (ctx.device_config) |dcfg| {
-                                if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
-                                    rumble_log.debug("[{s}] MAX_DURATION: stop frame FAILED to emit", .{ctx.device_tag});
-                                }
+                                stop_sent = emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag);
                             }
+                        }
+                        if (stop_sent) {
+                            self.rumble_is_active = false;
+                            self.rumble_start_ns = 0;
+                            disarmTimer(self.rumble_max_duration_fd);
+                        } else {
+                            // Keep rumble_is_active=true so this timer fires
+                            // again next second to retry the stop frame.
+                            rumble_log.debug("[{s}] MAX_DURATION: stop frame FAILED to emit, will retry", .{ctx.device_tag});
                         }
                     }
                 }
@@ -693,29 +699,34 @@ pub const EventLoop = struct {
                                     });
                                 }
                                 if (result.emit_stop_frame) {
-                                    self.rumble_is_active = false;
-                                    self.rumble_start_ns = 0;
-                                    disarmTimer(self.rumble_max_duration_fd);
+                                    var stop_sent = false;
                                     if (ctx.allocator) |alloc| {
                                         if (ctx.device_config) |dcfg| {
-                                            if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
-                                                rumble_log.debug("[{s}] FF_STOP: stop frame FAILED to emit", .{ctx.device_tag});
-                                            }
+                                            stop_sent = emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag);
                                         }
+                                    }
+                                    if (stop_sent) {
+                                        self.rumble_is_active = false;
+                                        self.rumble_start_ns = 0;
+                                        disarmTimer(self.rumble_max_duration_fd);
+                                    } else {
+                                        rumble_log.debug("[{s}] FF_STOP: stop frame FAILED to emit, keeping rumble active", .{ctx.device_tag});
                                     }
                                 }
                                 armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
                             } else {
-                                self.rumble_is_active = false;
-                                self.rumble_start_ns = 0;
-                                disarmTimer(self.rumble_max_duration_fd);
-                                rumble_log.debug("[{s}] FF_STOP: auto_stop disabled, direct zero frame", .{ctx.device_tag});
+                                var stop_sent = false;
                                 if (ctx.allocator) |alloc| {
                                     if (ctx.device_config) |dcfg| {
-                                        if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
-                                            rumble_log.debug("[{s}] FF_STOP: direct zero frame FAILED to emit", .{ctx.device_tag});
-                                        }
+                                        stop_sent = emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag);
                                     }
+                                }
+                                if (stop_sent) {
+                                    self.rumble_is_active = false;
+                                    self.rumble_start_ns = 0;
+                                    disarmTimer(self.rumble_max_duration_fd);
+                                } else {
+                                    rumble_log.debug("[{s}] FF_STOP: direct zero frame FAILED to emit, keeping rumble active", .{ctx.device_tag});
                                 }
                             }
                         } else {
@@ -738,14 +749,12 @@ pub const EventLoop = struct {
                                 }
                             }
                             
-                            var forwarded = false;
                             const elapsed = now_ns - self.last_rumble_ns;
                             if (elapsed >= min_interval_ns) {
                                 if (ctx.allocator) |alloc| {
                                     if (ctx.device_config) |dcfg| {
                                         if (emitRumbleFrame(ctx.devices, alloc, dcfg, ff_ev.strong, ff_ev.weak, ctx.device_tag)) {
                                             self.last_rumble_ns = now_ns;
-                                            forwarded = true;
                                         } else {
                                             rumble_log.debug("[{s}] FF_PLAY: emitRumbleFrame FAILED id={d}", .{ ctx.device_tag, ff_ev.effect_id });
                                         }
@@ -757,7 +766,7 @@ pub const EventLoop = struct {
                                     @as(u64, @intCast(@min(elapsed, std.math.maxInt(u64)))),
                                 });
                             }
-                            if (scheduler_on and forwarded) {
+                            if (scheduler_on) {
                                 const next_dl = self.rumble_scheduler.onPlay(
                                     ff_ev.effect_id,
                                     ff_ev.duration_ms,
