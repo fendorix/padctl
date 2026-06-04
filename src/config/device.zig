@@ -244,7 +244,92 @@ fn fieldTypeSize(type_str: []const u8) ?i64 {
     return null;
 }
 
+pub fn isSuppressClass(class: []const u8) bool {
+    return std.mem.eql(u8, class, "suppress");
+}
+
+/// True when any interface is claimed via libusb (vendor or suppress class),
+/// which needs raw USB device-node access rather than a hidraw node.
+pub fn usesLibusb(cfg: *const DeviceConfig) bool {
+    for (cfg.device.interface) |iface| {
+        if (std.mem.eql(u8, iface.class, "vendor") or isSuppressClass(iface.class)) return true;
+    }
+    return false;
+}
+
+fn isSuppressInterface(cfg: *const DeviceConfig, iface_id: i64) bool {
+    for (cfg.device.interface) |iface| {
+        if (iface.id == iface_id) return isSuppressClass(iface.class);
+    }
+    return false;
+}
+
+/// Number of interfaces opened into the devices[] array (everything except
+/// suppress-class interfaces). Suppress interfaces are claimed separately and
+/// consume no DeviceIO slot.
+pub fn openedInterfaceCount(cfg: *const DeviceConfig) usize {
+    var n: usize = 0;
+    for (cfg.device.interface) |iface| {
+        if (!isSuppressClass(iface.class)) n += 1;
+    }
+    return n;
+}
+
+/// Map a USB interface id to its index in the devices[] array, counting only
+/// non-suppress interfaces. Returns null when the id is unknown or suppressed.
+pub fn deviceIndexForInterface(cfg: *const DeviceConfig, iface_id: i64) ?usize {
+    var idx: usize = 0;
+    for (cfg.device.interface) |iface| {
+        if (isSuppressClass(iface.class)) continue;
+        if (iface.id == iface_id) return idx;
+        idx += 1;
+    }
+    return null;
+}
+
+/// Inverse of deviceIndexForInterface: map a devices[] index back to its
+/// InterfaceConfig, skipping suppress interfaces. Returns null when out of range.
+pub fn interfaceForDeviceIndex(cfg: *const DeviceConfig, dev_idx: usize) ?*const InterfaceConfig {
+    var idx: usize = 0;
+    for (cfg.device.interface) |*iface| {
+        if (isSuppressClass(iface.class)) continue;
+        if (idx == dev_idx) return iface;
+        idx += 1;
+    }
+    return null;
+}
+
 pub fn validate(cfg: *const DeviceConfig) !void {
+    for (cfg.device.interface) |iface| {
+        const is_hid = std.mem.eql(u8, iface.class, "hid");
+        const is_vendor = std.mem.eql(u8, iface.class, "vendor");
+        const is_suppress = std.mem.eql(u8, iface.class, "suppress");
+        if (!is_hid and !is_vendor and !is_suppress) return error.InvalidConfig;
+        if (is_suppress and (iface.ep_in != null or iface.ep_out != null))
+            return error.InvalidConfig;
+    }
+
+    // An all-suppress config opens no read fd, so it can never be observed
+    // for liveness; require at least one readable (hid/vendor) interface.
+    if (openedInterfaceCount(cfg) == 0) return error.InvalidConfig;
+
+    // A suppress interface is claimed only to evict the kernel driver; it is
+    // never read or written, so no report/command/init may reference it.
+    for (cfg.report) |report| {
+        if (isSuppressInterface(cfg, report.interface)) return error.InvalidConfig;
+    }
+    if (cfg.commands) |cmds| {
+        var it = cmds.map.iterator();
+        while (it.next()) |entry| {
+            if (isSuppressInterface(cfg, entry.value_ptr.interface)) return error.InvalidConfig;
+        }
+    }
+    if (cfg.device.init) |init_cfg| {
+        if (init_cfg.interface) |iface_id| {
+            if (isSuppressInterface(cfg, iface_id)) return error.InvalidConfig;
+        }
+    }
+
     for (cfg.report) |report| {
         if (report.fields) |fields| {
             var seen_buf: [64][]const u8 = undefined;
@@ -529,6 +614,239 @@ test "device: load flydigi/vader5.toml succeeds" {
     try std.testing.expectEqualStrings("extended", cfg.report[0].name);
 }
 
+test "device: vader5 IF1 is claimed via libusb (vendor transport)" {
+    const allocator = std.testing.allocator;
+    const result = try parseFile(allocator, "devices/flydigi/vader5.toml");
+    defer result.deinit();
+
+    const cfg = result.value;
+    // IF1 read transport + IF2/IF3 suppress-only claims.
+    try std.testing.expectEqual(@as(usize, 3), cfg.device.interface.len);
+    try std.testing.expectEqual(@as(usize, 1), openedInterfaceCount(&cfg));
+    const if1 = cfg.device.interface[0];
+    try std.testing.expectEqual(@as(i64, 1), if1.id);
+    try std.testing.expectEqualStrings("vendor", if1.class);
+    try std.testing.expectEqual(@as(i64, 0x82), if1.ep_in orelse return error.MissingEpIn);
+    try std.testing.expectEqual(@as(i64, 0x06), if1.ep_out orelse return error.MissingEpOut);
+
+    try std.testing.expectEqualStrings("suppress", cfg.device.interface[1].class);
+    try std.testing.expectEqual(@as(i64, 2), cfg.device.interface[1].id);
+    try std.testing.expect(cfg.device.interface[1].ep_in == null);
+    try std.testing.expectEqualStrings("suppress", cfg.device.interface[2].class);
+    try std.testing.expectEqual(@as(i64, 3), cfg.device.interface[2].id);
+
+    const init_cfg = cfg.device.init orelse return error.MissingInit;
+    try std.testing.expectEqual(@as(i64, 1), init_cfg.interface orelse return error.MissingInterface);
+    try std.testing.expect(init_cfg.commands != null);
+    try std.testing.expect(init_cfg.enable != null);
+}
+
+test "device: vader5 blocks only xpad (regression #355)" {
+    const allocator = std.testing.allocator;
+    const result = try parseFile(allocator, "devices/flydigi/vader5.toml");
+    defer result.deinit();
+
+    // Blocking hid_generic/usbhid removed the hidraw node that discovery needs;
+    // padctl self-detaches the kernel HID driver at libusb claim, so only xpad
+    // must be blocked.
+    const blocked = result.value.device.block_kernel_drivers orelse return error.MissingBlockList;
+    try std.testing.expectEqual(@as(usize, 1), blocked.len);
+    try std.testing.expectEqualStrings("xpad", blocked[0]);
+    for (blocked) |drv| {
+        try std.testing.expect(!std.mem.eql(u8, drv, "hid_generic"));
+        try std.testing.expect(!std.mem.eql(u8, drv, "usbhid"));
+    }
+}
+
+test "device: usesLibusb true for vendor/suppress, false for hid-only" {
+    const allocator = std.testing.allocator;
+
+    const vader = try parseFile(allocator, "devices/flydigi/vader5.toml");
+    defer vader.deinit();
+    try std.testing.expect(usesLibusb(&vader.value));
+
+    const hid_only =
+        \\[device]
+        \\name = "H"
+        \\vid = 1
+        \\pid = 2
+        \\[[device.interface]]
+        \\id = 0
+        \\class = "hid"
+        \\[[report]]
+        \\name = "r"
+        \\interface = 0
+        \\size = 1
+        \\[report.match]
+        \\offset = 0
+        \\expect = [0x01]
+    ;
+    const hid = try parseString(allocator, hid_only);
+    defer hid.deinit();
+    try std.testing.expect(!usesLibusb(&hid.value));
+}
+
+fn suppressIndexToml(comptime suppress_first: bool) []const u8 {
+    const report_block =
+        \\[[device.interface]]
+        \\id = 5
+        \\class = "hid"
+        \\
+    ;
+    const suppress_block =
+        \\[[device.interface]]
+        \\id = 9
+        \\class = "suppress"
+        \\
+    ;
+    const head =
+        \\[device]
+        \\name = "Mixed"
+        \\vid = 0x1234
+        \\pid = 0x5678
+        \\
+    ;
+    const tail =
+        \\
+        \\[[report]]
+        \\name = "main"
+        \\interface = 5
+        \\size = 16
+        \\
+        \\[report.match]
+        \\offset = 0
+        \\expect = [0x00]
+        \\
+        \\[report.fields]
+        \\left_x = { offset = 6, type = "i16le" }
+        \\
+    ;
+    return if (suppress_first)
+        head ++ suppress_block ++ report_block ++ tail
+    else
+        head ++ report_block ++ suppress_block ++ tail;
+}
+
+test "device: suppress interface excluded from devices[] index regardless of order" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{ true, false }) |suppress_first| {
+        const result = try parseString(allocator, suppressIndexToml(suppress_first));
+        defer result.deinit();
+        const cfg = result.value;
+
+        try validate(&cfg);
+        try std.testing.expectEqual(@as(usize, 2), cfg.device.interface.len);
+        // Only the hid interface gets a devices[] slot.
+        try std.testing.expectEqual(@as(usize, 1), openedInterfaceCount(&cfg));
+        // The report interface (id 5) always resolves to devices[0] whether the
+        // suppress interface (id 9) precedes or follows it.
+        try std.testing.expectEqual(@as(?usize, 0), deviceIndexForInterface(&cfg, 5));
+        try std.testing.expectEqual(@as(?usize, null), deviceIndexForInterface(&cfg, 9));
+        // Inverse mapping yields the report interface, never the suppress one.
+        const iface0 = interfaceForDeviceIndex(&cfg, 0) orelse return error.MissingInterface;
+        try std.testing.expectEqual(@as(i64, 5), iface0.id);
+        try std.testing.expectEqual(@as(?*const InterfaceConfig, null), interfaceForDeviceIndex(&cfg, 1));
+    }
+}
+
+test "device: validate rejects suppress interface with endpoints" {
+    const allocator = std.testing.allocator;
+    const bad =
+        \\[device]
+        \\name = "Bad"
+        \\vid = 0x1234
+        \\pid = 0x5678
+        \\
+        \\[[device.interface]]
+        \\id = 1
+        \\class = "suppress"
+        \\ep_in = 0x81
+        \\
+        \\[[report]]
+        \\name = "main"
+        \\interface = 1
+        \\size = 8
+        \\
+        \\[report.match]
+        \\offset = 0
+        \\expect = [0x00]
+    ;
+    try std.testing.expectError(error.InvalidConfig, parseString(allocator, bad));
+}
+
+test "device: validate rejects report referencing a suppress interface" {
+    const allocator = std.testing.allocator;
+    const bad =
+        \\[device]
+        \\name = "Bad"
+        \\vid = 0x1234
+        \\pid = 0x5678
+        \\
+        \\[[device.interface]]
+        \\id = 1
+        \\class = "suppress"
+        \\
+        \\[[report]]
+        \\name = "main"
+        \\interface = 1
+        \\size = 8
+        \\
+        \\[report.match]
+        \\offset = 0
+        \\expect = [0x00]
+    ;
+    try std.testing.expectError(error.InvalidConfig, parseString(allocator, bad));
+}
+
+test "device: validate rejects report->suppress reference even with a readable interface" {
+    const allocator = std.testing.allocator;
+    // A readable hid interface (id 5) keeps openedInterfaceCount >= 1 so the
+    // all-suppress guard does NOT fire; the report targets the suppress
+    // interface (id 9), so only the report->suppress check can reject it.
+    const bad =
+        \\[device]
+        \\name = "Mixed"
+        \\vid = 0x1234
+        \\pid = 0x5678
+        \\
+        \\[[device.interface]]
+        \\id = 5
+        \\class = "hid"
+        \\
+        \\[[device.interface]]
+        \\id = 9
+        \\class = "suppress"
+        \\
+        \\[[report]]
+        \\name = "main"
+        \\interface = 9
+        \\size = 8
+        \\
+        \\[report.match]
+        \\offset = 0
+        \\expect = [0x00]
+    ;
+    try std.testing.expectError(error.InvalidConfig, parseString(allocator, bad));
+}
+
+test "device: validate rejects an all-suppress config with no readable interface" {
+    const ifaces = [_]InterfaceConfig{
+        .{ .id = 1, .class = "suppress" },
+        .{ .id = 2, .class = "suppress" },
+    };
+    const cfg = DeviceConfig{
+        .device = .{
+            .name = "AllSuppress",
+            .vid = 0x1234,
+            .pid = 0x5678,
+            .interface = &ifaces,
+        },
+        .report = &.{},
+    };
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+}
+
 test "device: force_feedback.auto_stop defaults to true when unspecified" {
     const allocator = std.testing.allocator;
     const result = try parseString(allocator, test_toml);
@@ -614,7 +932,7 @@ test "device: offset out of bounds returns error" {
     try std.testing.expectError(error.OffsetOutOfBounds, parseString(allocator, bad));
 }
 
-test "device: duplicate field name returns error" {
+test "device: validate rejects a config with no interface at all" {
     const cfg = DeviceConfig{
         .device = .{
             .name = "test",
@@ -624,7 +942,7 @@ test "device: duplicate field name returns error" {
         },
         .report = &.{},
     };
-    try validate(&cfg);
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
 }
 
 test "device: invalid transform returns error" {
