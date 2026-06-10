@@ -17,12 +17,20 @@ pub const MAX_EFFECTS = 16;
 pub const RumbleScheduler = struct {
     /// Per-slot deadline, indexed by FF effect id (0..MAX_EFFECTS-1).
     /// 0 = not playing.
-    /// INFINITE = playing with `replay.length == 0` (never auto-stops on its own).
-    /// positive, < INFINITE = absolute monotonic deadline in nanoseconds.
+    /// positive = absolute monotonic deadline in nanoseconds.
     slots: [MAX_EFFECTS]i128 = @splat(0),
 
-    /// Sentinel deadline for effects with infinite duration.
+    /// Sentinel deadline retained for defensive checks in onTimerExpired /
+    /// nextDeadline.  onPlay no longer creates INFINITE entries — length_ms=0
+    /// now uses INFINITE_FALLBACK_MS so the auto-stop timer always has a
+    /// finite deadline.
     pub const INFINITE: i128 = std.math.maxInt(i128);
+
+    /// Default duration (ms) substituted for `length_ms == 0` (kernel
+    /// "infinite" protocol value).  Games that want sustained rumble re-play
+    /// effects before expiry; a reasonable fallback ensures the userspace
+    /// auto-stop timer is always armed.
+    pub const INFINITE_FALLBACK_MS: i128 = 500;
 
     pub const ExpiryResult = struct {
         /// When true, the event loop must emit a stop frame to the HID device
@@ -34,15 +42,16 @@ pub const RumbleScheduler = struct {
     };
 
     /// Record that `effect_id` started playing with the given length.
-    /// `length_ms == 0` means infinite (never auto-stops on its own).
+    /// `length_ms == 0` means infinite in the kernel FF protocol; we
+    /// treat it as a capped finite duration so the userspace auto-stop
+    /// timer always has a deadline to fire.  Games re-play effects
+    /// before expiry, so a reasonable fallback does not cut intentional
+    /// rumble short.
     /// Out-of-range effect ids are ignored defensively.
     /// Returns the new earliest finite deadline, or null if none is pending.
     pub fn onPlay(self: *RumbleScheduler, effect_id: u8, length_ms: u16, now_ns: i128) ?i128 {
         if (effect_id >= MAX_EFFECTS) return self.nextDeadline();
-        self.slots[effect_id] = if (length_ms == 0)
-            INFINITE
-        else
-            now_ns + @as(i128, length_ms) * std.time.ns_per_ms;
+        self.slots[effect_id] = now_ns + @as(i128, if (length_ms == 0) INFINITE_FALLBACK_MS else length_ms) * std.time.ns_per_ms;
         return self.nextDeadline();
     }
 
@@ -148,23 +157,23 @@ test "rumble_scheduler: onTimerExpired at deadline clears slot and emits stop" {
     try testing.expectEqual(@as(?i128, null), sched.nextDeadline());
 }
 
-test "rumble_scheduler: infinite duration never contributes a deadline but stays playing" {
+test "rumble_scheduler: length_ms == 0 gets fallback deadline, expires normally" {
     var sched: RumbleScheduler = .{};
     const now: i128 = 5_000_000_000;
 
-    // length_ms == 0 means the kernel recorded an infinite-duration effect.
-    // The scheduler should disarm the timerfd (nothing to auto-stop) but
-    // still consider the slot "playing" so a spurious timer fire does not
-    // emit a stop frame.
+    // length_ms == 0 now uses INFINITE_FALLBACK_MS so the auto-stop
+    // timer always has a finite deadline.
+    const expected = now + INFINITE_FALLBACK_MS * std.time.ns_per_ms;
     const next_after_play = sched.onPlay(3, 0, now);
-    try testing.expectEqual(@as(?i128, null), next_after_play);
-    try testing.expectEqual(@as(?i128, null), sched.nextDeadline());
+    try testing.expectEqual(@as(?i128, expected), next_after_play);
+    try testing.expectEqual(@as(?i128, expected), sched.nextDeadline());
 
-    // If the timerfd fires later for some reason (e.g., another effect
-    // expired and left this one), we must not emit a stop frame.
-    const result = sched.onTimerExpired(now + 10 * std.time.ns_per_s);
-    try testing.expect(!result.emit_stop_frame);
+    // When the fallback deadline fires the slot is cleared and a stop
+    // frame is emitted.
+    const result = sched.onTimerExpired(expected);
+    try testing.expect(result.emit_stop_frame);
     try testing.expectEqual(@as(?i128, null), result.next_deadline_ns);
+    try testing.expectEqual(@as(?i128, null), sched.nextDeadline());
 }
 
 test "rumble_scheduler: long-then-short overlap does not prematurely emit stop" {
@@ -242,20 +251,19 @@ test "rumble_scheduler: onStop of one effect while another still plays must NOT 
     try testing.expectEqual(@as(?i128, a_deadline), result.next_deadline_ns);
 }
 
-test "rumble_scheduler: onStop of infinite-duration effect while another plays must NOT emit stop" {
+test "rumble_scheduler: onStop of fallback-duration effect while another plays must NOT emit stop" {
     var sched: RumbleScheduler = .{};
     const now: i128 = 0;
-    const b_deadline = 500 * std.time.ns_per_ms;
+    const fallback_deadline = now + INFINITE_FALLBACK_MS * std.time.ns_per_ms;
 
-    _ = sched.onPlay(0, 0, now); // infinite
+    _ = sched.onPlay(0, 0, now); // fallback duration
     _ = sched.onPlay(1, 500, now); // finite
 
-    // Stop the finite one; the infinite effect is still live → no stop frame.
+    // Stop the finite one; the fallback-duration effect is still live → no stop frame.
+    // nextDeadline returns the fallback effect's deadline.
     const result = sched.onStop(1);
     try testing.expect(!result.emit_stop_frame);
-    // nextDeadline returns null (infinite is not a finite deadline).
-    try testing.expectEqual(@as(?i128, null), result.next_deadline_ns);
-    _ = b_deadline;
+    try testing.expectEqual(@as(?i128, fallback_deadline), result.next_deadline_ns);
 }
 
 test "rumble_scheduler: out-of-range effect_id does not corrupt other slots" {
