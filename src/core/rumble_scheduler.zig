@@ -163,7 +163,7 @@ test "rumble_scheduler: length_ms == 0 gets fallback deadline, expires normally"
 
     // length_ms == 0 now uses INFINITE_FALLBACK_MS so the auto-stop
     // timer always has a finite deadline.
-    const expected = now + INFINITE_FALLBACK_MS * std.time.ns_per_ms;
+    const expected = now + RumbleScheduler.INFINITE_FALLBACK_MS * std.time.ns_per_ms;
     const next_after_play = sched.onPlay(3, 0, now);
     try testing.expectEqual(@as(?i128, expected), next_after_play);
     try testing.expectEqual(@as(?i128, expected), sched.nextDeadline());
@@ -254,7 +254,7 @@ test "rumble_scheduler: onStop of one effect while another still plays must NOT 
 test "rumble_scheduler: onStop of fallback-duration effect while another plays must NOT emit stop" {
     var sched: RumbleScheduler = .{};
     const now: i128 = 0;
-    const fallback_deadline = now + INFINITE_FALLBACK_MS * std.time.ns_per_ms;
+    const fallback_deadline = now + RumbleScheduler.INFINITE_FALLBACK_MS * std.time.ns_per_ms;
 
     _ = sched.onPlay(0, 0, now); // fallback duration
     _ = sched.onPlay(1, 500, now); // finite
