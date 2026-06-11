@@ -16,6 +16,7 @@ const HidrawDevice = @import("io/hidraw.zig").HidrawDevice;
 const readPhysicalPath = @import("io/hidraw.zig").readPhysicalPath;
 const readInterfaceId = @import("io/hidraw.zig").readInterfaceId;
 const netlink = @import("io/netlink.zig");
+const shadow_grab = @import("io/shadow_grab.zig");
 const ioctl = @import("io/ioctl_constants.zig");
 const config_paths = @import("config/paths.zig");
 const mapping_discovery = @import("config/mapping_discovery.zig");
@@ -74,6 +75,10 @@ pub const ManagedInstance = struct {
     /// `gcExpiredGrace()` tears the entry down. Set by `detach()` when
     /// `suspend_grace_sec > 0`; cleared on successful rebind.
     grace_deadline_ns: ?u64 = null,
+    /// Grabbed shadow /dev/input/event* fds of kernel drivers (e.g. xpad)
+    /// bound to this managed device (issue #406). Released on suspend and
+    /// teardown; refilled by the sweep on spawn/resume.
+    shadow_grabs: shadow_grab.GrabList = .{},
 };
 
 /// Config snapshot used for hot-reload diffing.
@@ -184,7 +189,10 @@ const HotplugPending = struct {
     devname: [64]u8,
     len: u8,
     retries: u8,
+    kind: PendingKind,
 };
+
+const PendingKind = enum { hidraw, input_grab };
 
 // 8 fixed (stop, hup, netlink, inotify, debounce, hotplug_retry, grace, liveness) + 1 listen + 4 clients.
 pub const SUPERVISOR_MAX_FDS: usize = 8 + 1 + 4;
@@ -574,6 +582,7 @@ pub const Supervisor = struct {
             m.thread.join();
             m.instance.quiesceOutputs(.{ .reset_input_state = true, .reset_mapper_state = true });
             m.instance.closeDeviceIO();
+            m.shadow_grabs.releaseAll();
             m.suspended = true;
             // Schedule grace deadline. Saturating add keeps us safe against
             // pathological `suspend_grace_sec` values.
@@ -801,6 +810,7 @@ pub const Supervisor = struct {
             .switch_mapping = null,
             .default_mapping_pr = default_pr,
         });
+        sweepShadowNodes(&self.managed.items[self.managed.items.len - 1]);
     }
 
     fn pruneStaleSuspendedForId(self: *Supervisor, vid: u16, pid: u16, keep_phys: []const u8) void {
@@ -826,6 +836,7 @@ pub const Supervisor = struct {
     }
 
     fn teardownManaged(self: *Supervisor, m: *ManagedInstance) void {
+        m.shadow_grabs.releaseAll();
         if (m.switch_mapping) |pm| {
             pm.deinit();
             self.allocator.destroy(pm);
@@ -902,6 +913,7 @@ pub const Supervisor = struct {
         m.suspended = false;
         m.grace_deadline_ns = null;
         self.armGraceTimer();
+        sweepShadowNodes(m);
     }
 
     fn clearSwitchMapping(self: *Supervisor, m: *ManagedInstance) void {
@@ -1334,18 +1346,73 @@ pub const Supervisor = struct {
         }
     }
 
-    fn netlinkCallback(self: *Supervisor, action: netlink.UeventAction, devname: []const u8) void {
-        switch (action) {
-            .add => self.attach(devname) catch |err| {
-                if (err == error.HotplugTransient) {
-                    self.enqueueHotplugRetry(devname);
-                } else {
-                    std.log.warn("hotplug attach {s}: {}", .{ devname, err });
-                }
+    fn netlinkCallback(self: *Supervisor, action: netlink.UeventAction, subsystem: netlink.Subsystem, devname: []const u8) void {
+        switch (subsystem) {
+            .hidraw => switch (action) {
+                .add => self.attach(devname) catch |err| {
+                    if (err == error.HotplugTransient) {
+                        self.enqueueHotplugRetry(devname);
+                    } else {
+                        std.log.warn("hotplug attach {s}: {}", .{ devname, err });
+                    }
+                },
+                .remove => self.detach(devname),
+                .other => {},
             },
-            .remove => self.detach(devname),
-            .other => {},
+            .input => switch (action) {
+                .add => self.handleInputNodeAdd(devname),
+                .remove => self.handleInputNodeRemove(devname),
+                .other => {},
+            },
         }
+    }
+
+    fn shadowParams(m: *const ManagedInstance) shadow_grab.Params {
+        const cfg = m.instance.device_cfg;
+        return .{
+            .phys_vendor = @intCast(cfg.device.vid),
+            .phys_product = @intCast(cfg.device.pid),
+        };
+    }
+
+    /// Offer `node` to every active managed instance. `.access_denied` means
+    /// the open raced udev permission setup and a retry may succeed.
+    fn tryGrabForManaged(self: *Supervisor, node: []const u8) shadow_grab.GrabResult {
+        var denied = false;
+        for (self.managed.items) |*m| {
+            if (m.suspended) continue;
+            switch (shadow_grab.tryGrabNode(&m.shadow_grabs, "/dev/input", node, shadowParams(m))) {
+                .grabbed => return .grabbed,
+                .access_denied => denied = true,
+                .skipped => {},
+            }
+        }
+        return if (denied) .access_denied else .skipped;
+    }
+
+    /// Netlink saw a new /dev/input/event* node: grab it if it shadows an
+    /// active managed device.
+    fn handleInputNodeAdd(self: *Supervisor, devname: []const u8) void {
+        const node = std.fs.path.basename(devname);
+        if (self.tryGrabForManaged(node) == .access_denied) {
+            self.enqueueRetry(.input_grab, node);
+        }
+    }
+
+    /// Netlink saw a /dev/input/event* node disappear: drop any stale grab so
+    /// a future node reusing the same eventN name stays grabbable.
+    fn handleInputNodeRemove(self: *Supervisor, devname: []const u8) void {
+        const node = std.fs.path.basename(devname);
+        for (self.managed.items) |*m| {
+            if (m.shadow_grabs.evict(node)) return;
+        }
+    }
+
+    /// Grab pre-existing shadow nodes when an instance becomes active (spawn
+    /// and resume) — a shadow that predates the daemon never produces a
+    /// netlink ADD.
+    fn sweepShadowNodes(m: *ManagedInstance) void {
+        shadow_grab.sweepDir(&m.shadow_grabs, "/dev/input", shadowParams(m));
     }
 
     fn drainNetlink(self: *Supervisor) void {
@@ -1363,15 +1430,20 @@ pub const Supervisor = struct {
     }
 
     fn enqueueHotplugRetry(self: *Supervisor, devname: []const u8) void {
+        self.enqueueRetry(.hidraw, devname);
+    }
+
+    fn enqueueRetry(self: *Supervisor, kind: PendingKind, devname: []const u8) void {
         if (self.hotplug_retry_fd < 0) return;
         for (self.hotplug_pending.items) |pending| {
-            if (std.mem.eql(u8, pending.devname[0..pending.len], devname)) return;
+            if (pending.kind == kind and std.mem.eql(u8, pending.devname[0..pending.len], devname)) return;
         }
         var entry: HotplugPending = undefined;
         const n = @min(devname.len, entry.devname.len);
         @memcpy(entry.devname[0..n], devname[0..n]);
         entry.len = @intCast(n);
         entry.retries = 0;
+        entry.kind = kind;
         self.hotplug_pending.append(self.allocator, entry) catch return;
         const spec = linux.itimerspec{
             .it_value = .{ .sec = 0, .nsec = 300_000_000 },
@@ -1415,6 +1487,20 @@ pub const Supervisor = struct {
         while (i < self.hotplug_pending.items.len) {
             const p = &self.hotplug_pending.items[i];
             const name = p.devname[0..p.len];
+            if (p.kind == .input_grab) {
+                if (self.tryGrabForManaged(name) == .access_denied) {
+                    p.retries += 1;
+                    if (p.retries >= 3) {
+                        std.log.debug("shadow grab: giving up on {s} after 3 retries", .{name});
+                        _ = self.hotplug_pending.swapRemove(i);
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    _ = self.hotplug_pending.swapRemove(i);
+                }
+                continue;
+            }
             self.attach(name) catch |err| {
                 if (err != error.HotplugTransient) {
                     std.log.warn("hotplug retry {s}: {}, dropping", .{ name, err });
@@ -2896,6 +2982,28 @@ test "supervisor: cold-scan retry queues hidraw basename" {
     try testing.expectEqual(@as(usize, 1), sup.hotplug_pending.items.len);
     const item = sup.hotplug_pending.items[0];
     try testing.expectEqualStrings("hidraw2", item.devname[0..item.len]);
+}
+
+test "supervisor: input grab retry dedups per kind and drains non-denied nodes" {
+    const allocator = testing.allocator;
+
+    var sup = try Supervisor.initForTest(allocator);
+    defer sup.deinit();
+    sup.hotplug_retry_fd = try posix.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+
+    sup.enqueueRetry(.input_grab, "event5");
+    sup.enqueueRetry(.input_grab, "event5");
+    try testing.expectEqual(@as(usize, 1), sup.hotplug_pending.items.len);
+    try testing.expectEqual(PendingKind.input_grab, sup.hotplug_pending.items[0].kind);
+
+    // Same name under a different kind is a distinct entry.
+    sup.enqueueRetry(.hidraw, "event5");
+    try testing.expectEqual(@as(usize, 2), sup.hotplug_pending.items.len);
+    _ = sup.hotplug_pending.swapRemove(1);
+
+    // Node gone (or readable but not a shadow): the retry entry is dropped.
+    sup.drainHotplugRetry();
+    try testing.expectEqual(@as(usize, 0), sup.hotplug_pending.items.len);
 }
 
 test "supervisor: cold-scan retry is inert when retry timer is unavailable" {
