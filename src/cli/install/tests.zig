@@ -4329,3 +4329,40 @@ test "install: should-verify true but start never attempted => verify" {
         phase_mod.verifyGateAction(true, .{ .start_attempted = false, .start_ran = false }),
     );
 }
+
+// Asserts the verify gate returns error.DaemonNotResponding (non-zero), not a
+// silent exit 0 when the daemon crash-loops and never answers STATUS.
+// The socket is bound (connect succeeds) but never accepted/answered.
+test "install: verify gate on reachable bus + dead daemon returns DaemonNotResponding" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const reachable_start = services_mod.StartOutcome{ .start_attempted = true, .start_ran = true };
+    try testing.expectEqual(
+        phase_mod.VerifyGateAction.verify,
+        phase_mod.verifyGateAction(true, reachable_start),
+    );
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const sock_path = try std.fmt.allocPrint(allocator, "{s}/dead.sock", .{root});
+    defer allocator.free(sock_path);
+
+    const listen_fd = bindTestSocket(sock_path) catch |err| {
+        if (err == error.AccessDenied) return error.SkipZigTest;
+        return err;
+    };
+    defer std.posix.close(listen_fd);
+
+    try testing.expectError(
+        error.DaemonNotResponding,
+        phase_mod.runVerifyPoll(sock_path, 200, 50, phase_mod.waitDaemonResponding),
+    );
+
+    // The deferred-start outcome is not .verify, so the composed gate never
+    // reaches the poll/error path even against the same dead socket.
+    const deferred = services_mod.StartOutcome{ .start_attempted = true, .start_ran = false };
+    try testing.expect(phase_mod.verifyGateAction(true, deferred) != .verify);
+}
