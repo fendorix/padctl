@@ -579,15 +579,21 @@ pub const EventLoop = struct {
                     });
                 }
                 if (result.emit_stop_frame) {
+                    var stop_sent = false;
                     if (ctx.allocator) |alloc| {
                         if (ctx.device_config) |dcfg| {
-                            if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
-                                rumble_log.debug("[{s}] TIMERFD: stop frame FAILED to emit", .{ctx.device_tag});
-                            }
+                            stop_sent = emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag);
                         }
                     }
+                    if (stop_sent) {
+                        armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
+                    } else {
+                        rumble_log.debug("[{s}] TIMERFD: stop frame FAILED to emit, retrying", .{ctx.device_tag});
+                        armRumbleStopFd(self.rumble_stop_fd, now_ns + 100 * std.time.ns_per_ms);
+                    }
+                } else {
+                    armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
                 }
-                armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
             }
 
             // Check uinput FF fd.
@@ -619,23 +625,32 @@ pub const EventLoop = struct {
                                     });
                                 }
                                 if (result.emit_stop_frame) {
+                                    var stop_sent = false;
                                     if (ctx.allocator) |alloc| {
                                         if (ctx.device_config) |dcfg| {
-                                            if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
-                                                rumble_log.debug("[{s}] FF_STOP: stop frame FAILED to emit", .{ctx.device_tag});
-                                            }
+                                            stop_sent = emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag);
                                         }
                                     }
+                                    if (stop_sent) {
+                                        armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
+                                    } else {
+                                        rumble_log.debug("[{s}] FF_STOP: stop frame FAILED to emit, retrying", .{ctx.device_tag});
+                                        armRumbleStopFd(self.rumble_stop_fd, now_ns + 100 * std.time.ns_per_ms);
+                                    }
+                                } else {
+                                    armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
                                 }
-                                armRumbleStopFd(self.rumble_stop_fd, result.next_deadline_ns);
                             } else {
                                 rumble_log.debug("[{s}] FF_STOP: auto_stop disabled, direct zero frame", .{ctx.device_tag});
+                                var stop_sent = false;
                                 if (ctx.allocator) |alloc| {
                                     if (ctx.device_config) |dcfg| {
-                                        if (!emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag)) {
-                                            rumble_log.debug("[{s}] FF_STOP: direct zero frame FAILED to emit", .{ctx.device_tag});
-                                        }
+                                        stop_sent = emitRumbleFrame(ctx.devices, alloc, dcfg, 0, 0, ctx.device_tag);
                                     }
+                                }
+                                if (!stop_sent) {
+                                    rumble_log.debug("[{s}] FF_STOP: direct zero frame FAILED to emit, retrying", .{ctx.device_tag});
+                                    armRumbleStopFd(self.rumble_stop_fd, now_ns + 100 * std.time.ns_per_ms);
                                 }
                             }
                         } else {
