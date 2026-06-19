@@ -23,8 +23,8 @@
 %define debug_package %{nil}
 
 Name:           padctl
-Version:        0.1.16
-Release:        2%{?dist}
+Version:        0.1.17
+Release:        1%{?dist}
 Summary:        HID gamepad remapper with declarative TOML config
 
 License:        LGPL-2.1-or-later
@@ -154,7 +154,7 @@ fi
 %systemd_postun_with_restart padctl.service
 
 %changelog
-* Sat Jun 21 2026 padctl maintainers <maintainers@padctl.dev> - 0.1.16-2
+* Sat Jun 21 2026 padctl maintainers <maintainers@padctl.dev> - 0.1.17-1
 - Fix %%files: use %%{_userunitdir}, %%{_udevrulesdir}, %%{_modulesloaddir} macros
 - modprobe uhid uinput in %%post so the daemon works before the next boot
 
