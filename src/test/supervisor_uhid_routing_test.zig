@@ -17,8 +17,10 @@
 //! routing switch inside `init` is exercised directly — the prior tests
 //! would stay green even if that switch degenerated to always-uinput.
 //! Additional coverage at the `/dev/uhid` kernel level lives in the Layer 2
-//! integration tests (`supervisor_uhid_grace_integration_test.zig`,
-//! privilege-gated on `PADCTL_TEST_REQUIRE_UHID`).
+//! integration tests (`supervisor_uhid_grace_integration_test.zig`). Those
+//! tests skip when /dev/uhid is unavailable, but hard-fail (rather than
+//! silently skipping) when `PADCTL_TEST_REQUIRE_UHID=1` is set — the shared
+//! `uhid_gate.zig` policy the privileged e2e job enforces.
 
 const std = @import("std");
 const posix = std.posix;
@@ -338,6 +340,45 @@ test "DeviceInstance.init: backend=uhid TOML routes via InitOptions test seam" {
     // clone_vid_pid absent → primary card must use daemon identity, not device VID/PID.
     try testing.expectEqual(@as(u32, 0xFADE), primary_ev.payload.vendor);
     try testing.expectEqual(@as(u32, 0xC001), primary_ev.payload.product);
+}
+
+test "DeviceInstance.init: IMU CREATE2 failure rolls back transferred primary owner once" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = testing.allocator;
+
+    const primary_fds = try posix.pipe2(.{ .NONBLOCK = true });
+    defer posix.close(primary_fds[0]);
+    // Pass the read end as the IMU UHID fd. initWithFd succeeds, then CREATE2
+    // deterministically fails to write; openUhidDevice cleans that unreturned
+    // IMU while DeviceInstance's function-scope rollback owns the primary.
+    const imu_fds = try posix.pipe2(.{ .NONBLOCK = true });
+    defer posix.close(imu_fds[1]);
+
+    const parsed = try device_mod.parseString(allocator, TEST_TOML_UHID_LEGAL);
+    defer parsed.deinit();
+    var mock = try MockDeviceIO.init(allocator, &.{});
+    defer mock.deinit();
+    const devices = try allocator.alloc(DeviceIO, 1);
+    defer allocator.free(devices);
+    devices[0] = mock.deviceIO();
+
+    var counter: u16 = 31;
+    try testing.expectError(error.UhidCreateFailed, DeviceInstance.init(
+        allocator,
+        &parsed.value,
+        null,
+        null,
+        &counter,
+        .{
+            .test_primary_uhid_fd = primary_fds[1],
+            .test_imu_uhid_fd = imu_fds[0],
+            .test_devices_override = devices,
+        },
+    ));
+
+    var scratch: [uhid.UHID_EVENT_SIZE]u8 = undefined;
+    _ = try readCreate2(primary_fds[0], &scratch);
+    try readDestroy(primary_fds[0], &scratch);
 }
 
 // clone_vid_pid routing tests.

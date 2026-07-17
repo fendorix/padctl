@@ -182,6 +182,62 @@ Each managed device prints one space-separated triple: `device=<name>`,
 devices appear on the same line. Exit code is 0 when the daemon answered
 and 1 when the response begins with `ERR` or the socket is unreachable.
 
+### OpenRC (non-systemd)
+
+padctl ships only a systemd unit, but the daemon itself has no systemd
+dependency — an OpenRC service works the same way. Run `padctl install`
+first regardless of init system: it installs the udev rules
+(`GROUP="input", MODE="0660"` on `hidraw`/`uinput`/`uhid`) that let a
+non-root service open the devices. On a host without systemd, `install`
+may print harmless notes about skipped `systemctl` steps.
+
+Then add your user to the `input` group yourself with
+`sudo usermod -aG input $USER` (see [udev Permissions](#udev-permissions))
+and re-log in — `install` prints this only as a hint, it does not change
+group membership. Without both the udev rules and `input` group
+membership, a non-root OpenRC service cannot access the hardware.
+
+Hotplug/resume reconnect also works without systemd: the udev rule invokes
+`padctl-reconnect-launch`, which detaches via `setsid` instead of
+`systemd-run` when it does not find a live systemd PID 1 at
+`/run/systemd/system`. This keeps the reconnect working under OpenRC,
+runit, and standalone/eudev setups. The reconnect script itself needs
+`bash` and util-linux (`setsid`, `runuser`) — busybox-only hosts
+(e.g. stock Alpine) must install them.
+
+Create `/etc/init.d/padctl`:
+
+```sh
+#!/sbin/openrc-run
+
+name="padctl"
+description="padctl gamepad compatibility daemon"
+
+command="/usr/bin/padctl"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+command_user="<user>:<user>"
+
+start_pre() {
+    checkpath --directory --owner <user>:<user> /run/padctl
+}
+
+depend() {
+    need localmount
+}
+```
+
+Replace `<user>` with the login user. Enable and start:
+
+```sh
+doas chmod +x /etc/init.d/padctl
+doas rc-update add padctl default
+doas rc-service padctl start
+```
+
+(`sudo` works the same as `doas`.) Contributed by @K1D77A, verified working
+on a Flydigi Vader 5 including Steam Input key rebinding.
+
 ## Run Manually
 
 Bare invocation — padctl auto-discovers configs via XDG paths:
@@ -256,7 +312,7 @@ default_mapping = "fps"
 output_profile = "dualsense-edge"  # optional; selects a device-declared output profile
 ```
 
-On daemon start, padctl matches the connected device name (case-insensitive), loads the named mapping profile automatically, and applies the optional output profile before creating the virtual gamepad. `output_profile` selects a profile declared by the device TOML; do not put it in a mapping file. The system path is the fallback for environments where `HOME` is not set (e.g. systemd services).
+On daemon start, padctl matches the connected device name (case-insensitive), loads the named mapping profile automatically, and applies the optional output profile before creating the virtual gamepad. `output_profile` selects a profile declared by the device TOML; do not put it in a mapping file. Use `padctl output-profile list --device <name>` to compare a device's choices and `padctl output-profile select <profile> --device <name>` to save one. Vader 5 keeps the 16-bit generic `dualsense-edge` option and also offers an 8-bit, wired USB native `dualsense-edge-native` option; see the [device config reference](device-config.md#output-profiles) for the tradeoff. The system path is the fallback for environments where `HOME` is not set (e.g. systemd services).
 
 `padctl switch <name>` automatically updates the user config, so the choice is remembered for bare `padctl switch` (re-apply without a name). Bare `padctl switch` (no argument) reads `default_mapping` from the connected device's entry in `config.toml`; if no entry exists, it prints `error: no default_mapping in config.toml for device "<name>"` and exits. To make the choice survive reboots, use `padctl switch <name> --persist` which copies the mapping and config to `/etc/padctl/` via sudo.
 
@@ -268,6 +324,9 @@ padctl switch <name> --persist             # switch + copy to /etc/padctl/ for r
 padctl status [--socket <path>]            # show daemon status
 padctl devices [--socket <path>]           # list connected devices
 padctl list-mappings [--config-dir <dir>]  # list available mapping profiles
+padctl output-profile list [--device <name>]  # compare device output identities/protocols
+padctl output-profile select <name> --device <name>  # save a per-device output profile
+padctl output-profile reset --device <name>  # return to the device default output
 padctl reload [--pid <pid>]                # send SIGHUP to reload configs
 padctl config list                         # show XDG config search paths
 padctl config init [--device <name>]       # interactive mapping creator; templates: default, fps, racing, fighting
@@ -283,7 +342,7 @@ See the [Diagnostic Logging guide](diagnostic-logging.md) for the full `padctl d
 
 ## udev Permissions
 
-padctl needs access to `/dev/hidraw*`, `/dev/uinput`, and `/dev/uhid`. The first two are standard for HID gamepad daemons; `/dev/uhid` is required for the SDL3-visible IMU pairing path (per ADR-015). `padctl install` writes the necessary udev rules (`60-padctl.rules`) automatically.
+padctl needs access to `/dev/hidraw*`, `/dev/uinput`, and `/dev/uhid`. The first two are standard for HID gamepad daemons; `/dev/uhid` is required for the SDL3-visible IMU pairing path (per ADR-015) and native HID output profiles such as `dualsense-edge-native`. `padctl install` writes the necessary udev rules (`60-padctl.rules`) automatically.
 
 The `padctl install` command generates and installs udev rules automatically from device configs.
 
