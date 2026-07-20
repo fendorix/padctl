@@ -20,6 +20,7 @@ const REL_HWHEEL: u16 = c.REL_HWHEEL;
 const remap_mod = @import("remap.zig");
 const gesture_mod = @import("gesture.zig");
 const chord_detector_mod = @import("chord_detector.zig");
+const input_trace = @import("../diagnostics/input_trace.zig");
 pub const RemapTargetResolved = remap_mod.RemapTargetResolved;
 pub const resolveTarget = remap_mod.resolveTarget;
 pub const AuxEvent = aux_event_mod.AuxEvent;
@@ -51,6 +52,11 @@ pub const LayerTimerEvents = struct {
     aux: AuxEventList = .{},
 };
 
+pub const MacroTimerEvents = struct {
+    gamepad: ?GamepadState = null,
+    aux: AuxEventList = .{},
+};
+
 const BUTTON_COUNT = @typeInfo(ButtonId).@"enum".fields.len;
 
 const ResolvedRemap = struct {
@@ -64,6 +70,7 @@ const AuxDownTarget = union(enum) {
 };
 
 const AUX_TAP_RELEASE_DELAY_NS: i128 = 30 * std.time.ns_per_ms;
+const GAMEPAD_GESTURE_TAP_RELEASE_DELAY_NS: i128 = 120 * std.time.ns_per_ms;
 const AUX_TAP_RELEASE_TOKEN_SLOTS = BUTTON_COUNT;
 const GESTURE_TOKEN_SLOTS = gesture_mod.GESTURE_SLOTS * 2;
 
@@ -110,10 +117,72 @@ const AuxTapReleaseTokenTable = struct {
     }
 };
 
+const GestureGamepadTapReleaseTokenEntry = struct {
+    token: u32,
+    mask: u64,
+};
+
+const GestureGamepadTapReleaseTokenTable = struct {
+    // One live tap per physical source.  Indexing by source preserves overlapping
+    // taps that happen to target the same virtual button.
+    entries: [BUTTON_COUNT]?GestureGamepadTapReleaseTokenEntry =
+        [_]?GestureGamepadTapReleaseTokenEntry{null} ** BUTTON_COUNT,
+
+    fn replaceSource(
+        self: *GestureGamepadTapReleaseTokenTable,
+        src_idx: u6,
+        entry: GestureGamepadTapReleaseTokenEntry,
+    ) ?GestureGamepadTapReleaseTokenEntry {
+        const prior = self.entries[src_idx];
+        self.entries[src_idx] = entry;
+        return prior;
+    }
+
+    fn take(self: *GestureGamepadTapReleaseTokenTable, token: u32) ?GestureGamepadTapReleaseTokenEntry {
+        for (&self.entries) |*e| {
+            if (e.*) |v| {
+                if (v.token == token) {
+                    e.* = null;
+                    return v;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn takeSource(self: *GestureGamepadTapReleaseTokenTable, src_idx: u6) ?GestureGamepadTapReleaseTokenEntry {
+        const prior = self.entries[src_idx];
+        self.entries[src_idx] = null;
+        return prior;
+    }
+
+    fn activeMask(self: *const GestureGamepadTapReleaseTokenTable) u64 {
+        var mask: u64 = 0;
+        for (self.entries) |entry| {
+            if (entry) |e| mask |= e.mask;
+        }
+        return mask;
+    }
+
+    fn clear(self: *GestureGamepadTapReleaseTokenTable) void {
+        self.entries = [_]?GestureGamepadTapReleaseTokenEntry{null} ** BUTTON_COUNT;
+    }
+};
+
 const GestureTokenEntry = struct {
     token: u32,
     src_idx: u6,
     leg: gesture_mod.GestureLeg,
+};
+
+// Gyro joystick processing is stateful and runs only on physical input
+// frames. Timer-origin output frames reuse the last axes it produced instead
+// of recomputing motion or briefly exposing the underlying physical sticks.
+const GyroJoystickAxes = struct {
+    ax: ?i16 = null,
+    ay: ?i16 = null,
+    rx: ?i16 = null,
+    ry: ?i16 = null,
 };
 
 // Maps live timer tokens armed by the gesture engine back to (slot, leg) so
@@ -153,6 +222,7 @@ pub const Mapper = struct {
     state: GamepadState,
     prev: GamepadState,
     gyro_proc: gyro.GyroProcessor,
+    last_gyro_joystick_axes: GyroJoystickAxes,
     stick_left: stick.StickProcessor,
     stick_right: stick.StickProcessor,
     suppressed_buttons: u64,
@@ -163,15 +233,13 @@ pub const Mapper = struct {
     gesture_aux_down_targets: [BUTTON_COUNT]?AuxDownTarget,
     pending_tap_release: ?u64,
     aux_tap_release_tokens: AuxTapReleaseTokenTable,
+    gesture_gamepad_tap_release_tokens: GestureGamepadTapReleaseTokenTable,
     // Gamepad-button taps emitted by macro timer expiry need one apply() cycle
     // to reach output before pending_tap_release fires; staged here, promoted
     // to injected+pending_tap_release at the next apply.
     macro_timer_tap_pending: u64,
     gesture_engine: gesture_mod.GestureEngine,
     gesture_tokens: GestureTokenTable,
-    // Same staging discipline as macro_timer_tap_pending: gamepad taps emitted
-    // from gesture timer expiry need one apply() to reach output.
-    gesture_timer_tap_pending: u64,
     // Gamepad bits held by an active gesture hold leg; re-asserted each frame
     // until the hold leg emits its release.
     gesture_held_gamepad: u64,
@@ -228,6 +296,7 @@ pub const Mapper = struct {
             .state = .{},
             .prev = .{},
             .gyro_proc = .{},
+            .last_gyro_joystick_axes = .{},
             .stick_left = .{},
             .stick_right = .{},
             .suppressed_buttons = 0,
@@ -237,10 +306,10 @@ pub const Mapper = struct {
             .gesture_aux_down_targets = [_]?AuxDownTarget{null} ** BUTTON_COUNT,
             .pending_tap_release = null,
             .aux_tap_release_tokens = .{},
+            .gesture_gamepad_tap_release_tokens = .{},
             .macro_timer_tap_pending = 0,
             .gesture_engine = .{},
             .gesture_tokens = .{},
-            .gesture_timer_tap_pending = 0,
             .gesture_held_gamepad = 0,
             .layer_held_gamepad = 0,
             .layer_hold_aux_down = null,
@@ -277,6 +346,7 @@ pub const Mapper = struct {
         self.state = seeded;
         self.prev = seeded;
         self.seeded_buttons = seeded.buttons;
+        self.last_gyro_joystick_axes = .{};
     }
 
     pub fn resetRuntimeState(self: *Mapper) void {
@@ -285,6 +355,7 @@ pub const Mapper = struct {
         self.state = .{};
         self.prev = .{};
         self.gyro_proc.reset();
+        self.last_gyro_joystick_axes = .{};
         self.stick_left.reset();
         self.stick_right.reset();
         self.suppressed_buttons = 0;
@@ -294,10 +365,10 @@ pub const Mapper = struct {
         self.gesture_aux_down_targets = [_]?AuxDownTarget{null} ** BUTTON_COUNT;
         self.pending_tap_release = null;
         self.aux_tap_release_tokens = .{};
+        self.gesture_gamepad_tap_release_tokens = .{};
         self.macro_timer_tap_pending = 0;
         self.gesture_engine.reset();
         self.gesture_tokens.clear();
-        self.gesture_timer_tap_pending = 0;
         self.gesture_held_gamepad = 0;
         // callers must releaseMapperAux first; this only clears state, no release edge.
         self.layer_held_gamepad = 0;
@@ -354,6 +425,7 @@ pub const Mapper = struct {
             }
         }
         releasePendingAuxTapReleases(self, &aux, null);
+        self.gesture_gamepad_tap_release_tokens.clear();
         return aux;
     }
 
@@ -411,14 +483,6 @@ pub const Mapper = struct {
             self.pending_tap_release = existing | self.macro_timer_tap_pending;
             self.macro_timer_tap_pending = 0;
             for (self.active_macros.items) |*p| p.staged_timer_taps = 0;
-        }
-
-        // Promote gesture-timer tap bits staged at last expiry.
-        if (self.gesture_timer_tap_pending != 0) {
-            self.injected_buttons |= self.gesture_timer_tap_pending;
-            const existing = self.pending_tap_release orelse 0;
-            self.pending_tap_release = existing | self.gesture_timer_tap_pending;
-            self.gesture_timer_tap_pending = 0;
         }
 
         // Suppress layer trigger buttons so they don't leak to uinput output.
@@ -552,6 +616,16 @@ pub const Mapper = struct {
                 }
             }
 
+            // A new press ends any timer-owned tap from this physical source
+            // before dispatching the source's current target. This must live at
+            // the common mapping entry because a layer may have changed the
+            // source from a gesture to another target kind, or to no mapping,
+            // since the tap.
+            if (pressed and !prev_pressed) {
+                if (self.gesture_gamepad_tap_release_tokens.takeSource(@intCast(i))) |prior| {
+                    self.timer_queue.cancel(prior.token, now_ns);
+                }
+            }
             const target = per_src_inject[i] orelse continue;
             switch (target) {
                 .macro => |name| {
@@ -594,8 +668,26 @@ pub const Mapper = struct {
                 .chord => {},
                 .gesture => |node| {
                     if (pressed != prev_pressed) {
-                        const out = self.gesture_engine.onButtonEdge(@intCast(i), node, pressed, now_ns);
-                        self.applyGestureOutcome(@intCast(i), out, &aux, false, now_ns);
+                        const src_idx: u6 = @intCast(i);
+                        const trace_enabled = input_trace.enabled();
+                        const press_started_ns = if (trace_enabled and !pressed) self.gesture_engine.pressStartedAt(src_idx) else null;
+                        const out = self.gesture_engine.onButtonEdge(src_idx, node, pressed, now_ns);
+                        if (trace_enabled) {
+                            const arm_leg = if (out.arm) |a| @tagName(a.leg) else "none";
+                            const arm_deadline_ns = if (out.arm) |a| a.deadline_ns else @as(i128, 0);
+                            input_trace.logGestureEdge(
+                                buttonNameFromIndex(@intCast(i)),
+                                pressed,
+                                now_ns,
+                                if (press_started_ns) |start| @max(now_ns - start, 0) else 0,
+                                out.emit_len,
+                                arm_leg,
+                                arm_deadline_ns,
+                                out.cancel_hold,
+                                out.cancel_double,
+                            );
+                        }
+                        _ = self.applyGestureOutcome(src_idx, out, &aux, false, now_ns);
                     }
                 },
             }
@@ -605,12 +697,18 @@ pub const Mapper = struct {
         // emits press once, so the bit must persist across frames until release.
         self.injected_buttons |= self.gesture_held_gamepad;
 
+        // Gamepad taps need a minimum observable duration just like key/mouse
+        // taps.  Re-assert them until their timer emits an explicit release.
+        self.injected_buttons |= self.gesture_gamepad_tap_release_tokens.activeMask();
+
         // Re-assert the active layer's `hold` passthrough gamepad bit each frame.
         self.injected_buttons |= self.layer_held_gamepad;
 
         // Gesture hold legs and layer hold passthrough drive LT/RT via these
         // masks rather than per_src_inject; give them the same analog floor.
-        const held_gamepad = self.gesture_held_gamepad | self.layer_held_gamepad;
+        const held_gamepad = self.gesture_held_gamepad |
+            self.layer_held_gamepad |
+            self.gesture_gamepad_tap_release_tokens.activeMask();
         if (held_gamepad & buttonBit("LT") != 0) inject_axes.lt = 255;
         if (held_gamepad & buttonBit("RT") != 0) inject_axes.rt = 255;
 
@@ -667,6 +765,8 @@ pub const Mapper = struct {
             emit_state.dpad_y = 0;
         }
 
+        applyGamepadStickDeadzones(&emit_state, &left_cfg, &right_cfg);
+
         // gyro joystick mode: override or blend stick axes, suppress originals
         if (suppress_right_stick_gyro) {
             if (gyro_joy_x) |jx| emit_state.rx = if (gyro_blend_stick)
@@ -689,6 +789,16 @@ pub const Mapper = struct {
                 jy;
         }
 
+        // Cache only axes actually controlled by gyro joystick mode. Physical
+        // input frames replace this snapshot atomically; timer frames can then
+        // reuse it without advancing the stateful gyro processor.
+        self.last_gyro_joystick_axes = .{
+            .ax = if (suppress_left_stick_gyro and gyro_joy_x != null) emit_state.ax else null,
+            .ay = if (suppress_left_stick_gyro and gyro_joy_y != null) emit_state.ay else null,
+            .rx = if (suppress_right_stick_gyro and gyro_joy_x != null) emit_state.rx else null,
+            .ry = if (suppress_right_stick_gyro and gyro_joy_y != null) emit_state.ry else null,
+        };
+
         // suppress stick axes when mode != gamepad
         if (!suppress_left_stick_gyro and (left_cfg.suppress_gamepad or !std.mem.eql(u8, left_cfg.mode, "gamepad"))) {
             emit_state.ax = 0;
@@ -707,6 +817,7 @@ pub const Mapper = struct {
             masked_prev.dpad_x = 0;
             masked_prev.dpad_y = 0;
         }
+        applyGamepadStickDeadzones(&masked_prev, &left_cfg, &right_cfg);
 
         self.prev = self.state;
 
@@ -734,6 +845,7 @@ pub const Mapper = struct {
             // Plain hold activation has no active_changed apply() chokepoint, so
             // perform the gesture/layer-hold cleanup here without touching the
             // macro queue; layer-timer expiry is not the macro timerfd.
+            self.last_gyro_joystick_axes = .{};
             self.prev.dpad_x = 0;
             self.prev.dpad_y = 0;
             self.cancelGestureStateForLayerChange(&events.aux, now_ns);
@@ -745,6 +857,7 @@ pub const Mapper = struct {
 
     fn handleLayerActiveChanged(self: *Mapper, aux: *AuxEventList, now_ns: i128) void {
         self.gyro_proc.reset();
+        self.last_gyro_joystick_axes = .{};
         self.stick_left.reset();
         self.stick_right.reset();
         // Reset dpad prev so edge detection fires on the next frame.
@@ -850,13 +963,14 @@ pub const Mapper = struct {
     fn currentMappedGamepadFrame(self: *Mapper) GamepadState {
         const configs = self.config.layer orelse &.{};
         var suppressed: u64 = 0;
-        var injected: u64 = self.gesture_held_gamepad | self.layer_held_gamepad;
+        const gesture_tap_mask = self.gesture_gamepad_tap_release_tokens.activeMask();
+        var injected: u64 = self.gesture_held_gamepad | self.layer_held_gamepad | gesture_tap_mask;
         var per_src_inject: [BUTTON_COUNT]?RemapTargetResolved = [_]?RemapTargetResolved{null} ** BUTTON_COUNT;
         var inject_axes: remap_mod.AxisFloor = .{};
 
         // Mirror apply(): hold masks and macro holds driving LT/RT raise the
         // analog axis floor so timer-emitted frames match regular frames.
-        const held_gamepad = self.gesture_held_gamepad | self.layer_held_gamepad;
+        const held_gamepad = self.gesture_held_gamepad | self.layer_held_gamepad | gesture_tap_mask;
         if (held_gamepad & buttonBit("LT") != 0) inject_axes.lt = 255;
         if (held_gamepad & buttonBit("RT") != 0) inject_axes.rt = 255;
 
@@ -922,6 +1036,7 @@ pub const Mapper = struct {
 
         const left_cfg = self.effectiveStickConfig(.left);
         const right_cfg = self.effectiveStickConfig(.right);
+        applyGamepadStickDeadzones(&emit_state, &left_cfg, &right_cfg);
         if (left_cfg.suppress_gamepad or !std.mem.eql(u8, left_cfg.mode, "gamepad")) {
             emit_state.ax = 0;
             emit_state.ay = 0;
@@ -930,6 +1045,10 @@ pub const Mapper = struct {
             emit_state.rx = 0;
             emit_state.ry = 0;
         }
+        if (self.last_gyro_joystick_axes.ax) |v| emit_state.ax = v;
+        if (self.last_gyro_joystick_axes.ay) |v| emit_state.ay = v;
+        if (self.last_gyro_joystick_axes.rx) |v| emit_state.rx = v;
+        if (self.last_gyro_joystick_axes.ry) |v| emit_state.ry = v;
         return emit_state;
     }
 
@@ -946,10 +1065,9 @@ pub const Mapper = struct {
         return suppress;
     }
 
-    // Translate one gesture-engine Outcome into output. `from_timer` selects
-    // the gamepad-tap staging path: timer-context taps stage into
-    // gesture_timer_tap_pending so a full press is visible one frame before the
-    // release; apply-context taps use pending_tap_release directly.
+    // Translate one gesture-engine Outcome into output. Returns whether it
+    // changed gamepad state so timer-origin outcomes can emit a frame without
+    // waiting for another physical input report.
     fn applyGestureOutcome(
         self: *Mapper,
         src_idx: u6,
@@ -957,7 +1075,8 @@ pub const Mapper = struct {
         aux: *AuxEventList,
         from_timer: bool,
         now_ns: i128,
-    ) void {
+    ) bool {
+        var gamepad_changed = false;
         if (out.cancel_hold or out.cancel_double) {
             // Tokens are matched by value at expiry; cancel both the queue
             // entry and the routing record so a stale expiry is inert.
@@ -974,6 +1093,16 @@ pub const Mapper = struct {
             }
         }
         for (out.slice()) |em| {
+            if (input_trace.enabled()) {
+                var target_buf: [64]u8 = undefined;
+                input_trace.logGestureEmit(
+                    buttonNameFromIndex(src_idx),
+                    @tagName(em.action),
+                    gestureTargetTraceLabel(em.target, &target_buf),
+                    from_timer,
+                    now_ns,
+                );
+            }
             switch (em.target) {
                 .gamepad_button => |dst| {
                     const mask = @as(u64, 1) << @as(u6, @intCast(@intFromEnum(dst)));
@@ -981,17 +1110,27 @@ pub const Mapper = struct {
                         .press => {
                             self.injected_buttons |= mask;
                             self.gesture_held_gamepad |= mask;
+                            gamepad_changed = true;
                         },
                         .release => {
                             self.injected_buttons &= ~mask;
                             self.gesture_held_gamepad &= ~mask;
+                            gamepad_changed = true;
                         },
-                        .tap => if (from_timer) {
-                            self.gesture_timer_tap_pending |= mask;
-                        } else {
-                            self.injected_buttons |= mask;
-                            const existing = self.pending_tap_release orelse 0;
-                            self.pending_tap_release = existing | mask;
+                        .tap => {
+                            if (emitDelayedGestureGamepadTap(self, src_idx, mask, now_ns)) {
+                                gamepad_changed = true;
+                            } else if (!from_timer) {
+                                // Preserve the existing one-frame fallback for
+                                // edge-origin taps if the release timer cannot
+                                // be armed. Timer-origin taps cannot safely use
+                                // that fallback because no later report is
+                                // guaranteed to emit their release.
+                                self.injected_buttons |= mask;
+                                const existing = self.pending_tap_release orelse 0;
+                                self.pending_tap_release = existing | mask;
+                                gamepad_changed = true;
+                            }
                         },
                     }
                 },
@@ -1016,15 +1155,20 @@ pub const Mapper = struct {
         if (out.arm) |a| {
             const token = self.next_token;
             self.next_token +%= 1;
-            self.timer_queue.arm(a.deadline_ns, token, now_ns) catch return;
+            self.timer_queue.arm(a.deadline_ns, token, now_ns) catch return gamepad_changed;
             self.gesture_tokens.put(token, src_idx, a.leg);
             self.gesture_engine.setArmToken(src_idx, a.leg, token);
         }
+        return gamepad_changed;
     }
 
     // Macro timerfd (slot 4) expiry only — must NOT call onLayerTimerExpired().
     pub fn onMacroTimerExpired(self: *Mapper, now_ns: i128) AuxEventList {
-        var aux = AuxEventList{};
+        return self.onMacroTimerExpiredEvents(now_ns).aux;
+    }
+
+    pub fn onMacroTimerExpiredEvents(self: *Mapper, now_ns: i128) MacroTimerEvents {
+        var events = MacroTimerEvents{};
         var macro_tap_release: u64 = 0;
         // Axis floor on timer-driven resume is discarded; the next Mapper.apply()
         // frame re-walks active macros and recomputes from held_axis_*.
@@ -1033,14 +1177,27 @@ pub const Mapper = struct {
         const expired = self.timer_queue.drainExpired(now_ns, &buf);
         for (expired) |d| {
             if (self.aux_tap_release_tokens.take(d.token)) |target| {
-                emitAuxDownRelease(target, &aux);
+                emitAuxDownRelease(target, &events.aux);
+                continue;
+            }
+            if (self.gesture_gamepad_tap_release_tokens.take(d.token) != null) {
+                events.gamepad = self.currentMappedGamepadFrame();
                 continue;
             }
             if (self.gesture_tokens.take(d.token)) |ge| {
                 const src_bit = @as(u64, 1) << ge.src_idx;
                 const held = (self.state.buttons & src_bit) != 0;
                 const out = self.gesture_engine.onTimerExpired(ge.src_idx, ge.leg, held, now_ns);
-                self.applyGestureOutcome(ge.src_idx, out, &aux, true, now_ns);
+                input_trace.logGestureTimer(
+                    buttonNameFromIndex(ge.src_idx),
+                    @tagName(ge.leg),
+                    held,
+                    out.emit_len,
+                    now_ns,
+                );
+                if (self.applyGestureOutcome(ge.src_idx, out, &events.aux, true, now_ns)) {
+                    events.gamepad = self.currentMappedGamepadFrame();
+                }
                 continue;
             }
             var idx: usize = 0;
@@ -1048,7 +1205,7 @@ pub const Mapper = struct {
                 if (self.active_macros.items[idx].timer_token == d.token) {
                     const before = macro_tap_release;
                     const done = self.active_macros.items[idx].step(
-                        &aux,
+                        &events.aux,
                         &self.timer_queue,
                         &self.injected_buttons,
                         &macro_tap_release,
@@ -1076,7 +1233,7 @@ pub const Mapper = struct {
             // before the gamepad output is ever emitted.
             self.macro_timer_tap_pending |= macro_tap_release;
         }
-        return aux;
+        return events;
     }
 
     fn findMacro(self: *const Mapper, name: []const u8) ?*const mapping.Macro {
@@ -1166,12 +1323,41 @@ fn resolveGyroAxis(axis: ?[]const u8, default: gyro.GyroAxis) gyro.GyroAxis {
 }
 
 fn resolveStickConfig(mc: *const mapping.StickConfig) stick.StickConfig {
+    const mode = mc.mode;
     return .{
-        .mode = mc.mode,
-        .deadzone = if (mc.deadzone) |v| @intCast(v) else 128,
+        .mode = mode,
+        .deadzone = if (mc.deadzone) |v| @intCast(v) else if (std.mem.eql(u8, mode, "gamepad")) 0 else 128,
         .sensitivity = if (mc.sensitivity) |v| @floatCast(v) else 1.0,
         .suppress_gamepad = mc.suppress_gamepad orelse false,
     };
+}
+
+fn buttonNameFromIndex(idx: u6) []const u8 {
+    const button: ButtonId = @enumFromInt(idx);
+    return @tagName(button);
+}
+
+fn gestureTargetTraceLabel(target: RemapTargetResolved, buf: *[64]u8) []const u8 {
+    return switch (target) {
+        .gamepad_button => |button| std.fmt.bufPrint(buf, "gamepad:{s}", .{@tagName(button)}) catch "gamepad:?",
+        .key => |code| std.fmt.bufPrint(buf, "key:{d}", .{code}) catch "key:?",
+        .mouse_button => |code| std.fmt.bufPrint(buf, "mouse:{d}", .{code}) catch "mouse:?",
+        .disabled => "disabled",
+        .macro => |name| std.fmt.bufPrint(buf, "macro:{s}", .{name}) catch "macro:?",
+        .chord => "chord",
+        .gesture => "gesture",
+    };
+}
+
+fn applyGamepadStickDeadzones(gs: *GamepadState, left_cfg: *const stick.StickConfig, right_cfg: *const stick.StickConfig) void {
+    if (std.mem.eql(u8, left_cfg.mode, "gamepad")) {
+        gs.ax = stick.applyAxisDeadzone(gs.ax, left_cfg.deadzone);
+        gs.ay = stick.applyAxisDeadzone(gs.ay, left_cfg.deadzone);
+    }
+    if (std.mem.eql(u8, right_cfg.mode, "gamepad")) {
+        gs.rx = stick.applyAxisDeadzone(gs.rx, right_cfg.deadzone);
+        gs.ry = stick.applyAxisDeadzone(gs.ry, right_cfg.deadzone);
+    }
 }
 
 fn freeResolvedRemap(allocator: std.mem.Allocator, r: ResolvedRemap) void {
@@ -1252,6 +1438,22 @@ fn emitDelayedAuxTap(self: *Mapper, target: RemapTargetResolved, aux: *AuxEventL
         _ = self.aux_tap_release_tokens.take(token);
         std.log.warn("aux tap release timer arm failed: {}", .{err});
         emitAuxDownRelease(down, aux);
+    };
+    return true;
+}
+
+fn emitDelayedGestureGamepadTap(self: *Mapper, src_idx: u6, mask: u64, now_ns: i128) bool {
+    const token = self.next_token;
+    self.next_token +%= 1;
+    if (self.gesture_gamepad_tap_release_tokens.replaceSource(src_idx, .{
+        .token = token,
+        .mask = mask,
+    })) |prior| self.timer_queue.cancel(prior.token, now_ns);
+
+    self.timer_queue.arm(now_ns + GAMEPAD_GESTURE_TAP_RELEASE_DELAY_NS, token, now_ns) catch |err| {
+        _ = self.gesture_gamepad_tap_release_tokens.take(token);
+        std.log.warn("gamepad tap release timer arm failed: {}", .{err});
+        return false;
     };
     return true;
 }
@@ -1357,8 +1559,8 @@ test "mapper: resetRuntimeState clears transient layer timer and input state" {
     m.seeded_buttons = buttonBit("A");
     m.pending_tap_release = buttonBit("B");
     m.macro_timer_tap_pending = buttonBit("X");
-    m.gesture_timer_tap_pending = buttonBit("Y");
     m.gesture_held_gamepad = buttonBit("RB");
+    m.last_gyro_joystick_axes = .{ .rx = 1234, .ry = -2345 };
     m.aux_down_targets[@intFromEnum(ButtonId.A)] = .{ .key = 30 };
     try m.timer_queue.arm(2_000, 99, 1_000);
 
@@ -1371,8 +1573,9 @@ test "mapper: resetRuntimeState clears transient layer timer and input state" {
     try testing.expectEqual(@as(u64, 0), m.seeded_buttons);
     try testing.expectEqual(@as(?u64, null), m.pending_tap_release);
     try testing.expectEqual(@as(u64, 0), m.macro_timer_tap_pending);
-    try testing.expectEqual(@as(u64, 0), m.gesture_timer_tap_pending);
     try testing.expectEqual(@as(u64, 0), m.gesture_held_gamepad);
+    try testing.expect(m.last_gyro_joystick_axes.rx == null);
+    try testing.expect(m.last_gyro_joystick_axes.ry == null);
     try testing.expect(m.aux_down_targets[@intFromEnum(ButtonId.A)] == null);
     try testing.expectEqual(@as(usize, 0), m.timer_queue.heap.count());
 }
@@ -1459,6 +1662,43 @@ test "mapper: gesture tap remap emits tap key through apply" {
     }
 }
 
+test "mapper: issue 492 stick-click tap remains observable until release timer" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[remap]
+        \\LS = { tap = "LS", hold = "KEY_Z" }
+        \\RS = { tap = "RS", hold = "KEY_Z" }
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const ls_mask = buttonBit("LS");
+    const stick_clicks = ls_mask | buttonBit("RS");
+    const t0: i128 = std.time.ns_per_s;
+
+    // The gesture consumes the physical press while it waits to distinguish tap/hold.
+    const press = try m.apply(.{ .buttons = stick_clicks }, 16, t0);
+    try testing.expectEqual(@as(u64, 0), press.gamepad.buttons & stick_clicks);
+
+    // Releasing before hold_ms chooses the tap leg and emits the virtual stick-click presses.
+    const tap = try m.apply(.{ .buttons = 0 }, 16, t0 + 10 * std.time.ns_per_ms);
+    try testing.expectEqual(stick_clicks, tap.gamepad.buttons & stick_clicks);
+
+    // A high-poll-rate controller reports again almost immediately. The virtual
+    // press must remain visible for the dedicated gamepad tap lifetime; a
+    // one-report pulse is too short for consumers to observe reliably.
+    const early = try m.apply(.{ .buttons = 0 }, 1, t0 + 11 * std.time.ns_per_ms);
+    try testing.expectEqual(stick_clicks, early.gamepad.buttons & stick_clicks);
+
+    // Release comes from the timer itself; it must not depend on another physical
+    // controller report after the stick click.
+    const release = m.onMacroTimerExpiredEvents(t0 + 130 * std.time.ns_per_ms);
+    try testing.expect(release.gamepad != null);
+    try testing.expectEqual(@as(u64, 0), release.gamepad.?.buttons & stick_clicks);
+}
+
 test "mapper: gesture hold gamepad bit persists then clears on release" {
     const allocator = testing.allocator;
     const parsed = try makeMapping(
@@ -1476,8 +1716,11 @@ test "mapper: gesture hold gamepad bit persists then clears on release" {
     // Press arms the hold timer.
     _ = try m.apply(.{ .buttons = a_mask }, 16, 0);
 
-    // Hold deadline fires while button still held -> gamepad press staged.
-    _ = m.onMacroTimerExpired(100 * std.time.ns_per_ms + 1);
+    // Hold deadline fires while button is still held -> gamepad press is
+    // returned immediately by the timer wakeup and remains asserted.
+    const hold = m.onMacroTimerExpiredEvents(100 * std.time.ns_per_ms + 1);
+    try testing.expect(hold.gamepad != null);
+    try testing.expect((hold.gamepad.?.buttons & rb_mask) != 0);
     try testing.expect((m.gesture_held_gamepad & rb_mask) != 0);
 
     // Next frame re-asserts the held bit into output.
@@ -1992,9 +2235,11 @@ test "mapper: hold_toggle timer transition resets processors" {
     m.stick_right.scroll_accum = -0.5;
 
     _ = try m.apply(.{ .buttons = lt_mask }, 16, 0);
+    m.last_gyro_joystick_axes.rx = 1234;
     _ = m.onLayerTimerExpired();
 
     try testing.expectEqual(@as(f32, 0), m.gyro_proc.ema_x);
+    try testing.expect(m.last_gyro_joystick_axes.rx == null);
     try testing.expectEqual(@as(f32, 0), m.stick_left.mouse_accum_x);
     try testing.expectEqual(@as(f32, 0), m.stick_right.scroll_accum);
 }
@@ -3037,6 +3282,57 @@ test "mapper: dt_ms propagation: stick mouse output scales with dt" {
     try testing.expect(diff <= 2);
 }
 
+test "mapper: issue 491 gamepad stick deadzone suppresses in-zone axes" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping(
+        \\[stick.left]
+        \\mode = "gamepad"
+        \\deadzone = 32767
+        \\sensitivity = 1.0
+        \\
+        \\[stick.right]
+        \\mode = "gamepad"
+        \\deadzone = 32767
+        \\sensitivity = 1.0
+    , allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    _ = try m.apply(.{ .ax = 100, .ay = -100, .rx = 100, .ry = -100 }, 16, 0);
+    const in_zone = try m.apply(.{ .ax = 200, .ay = -200, .rx = 200, .ry = -200 }, 16, 0);
+    try testing.expectEqual(@as(i16, 0), in_zone.gamepad.ax);
+    try testing.expectEqual(@as(i16, 0), in_zone.gamepad.ay);
+    try testing.expectEqual(@as(i16, 0), in_zone.gamepad.rx);
+    try testing.expectEqual(@as(i16, 0), in_zone.gamepad.ry);
+    try testing.expectEqual(@as(i16, 0), in_zone.prev.ax);
+    try testing.expectEqual(@as(i16, 0), in_zone.prev.ay);
+    try testing.expectEqual(@as(i16, 0), in_zone.prev.rx);
+    try testing.expectEqual(@as(i16, 0), in_zone.prev.ry);
+
+    const boundary = try m.apply(.{ .ax = 32767, .ay = -32768, .rx = 32767, .ry = -32768 }, 16, 0);
+    try testing.expectEqual(@as(i16, 32767), boundary.gamepad.ax);
+    try testing.expectEqual(@as(i16, -32768), boundary.gamepad.ay);
+    try testing.expectEqual(@as(i16, 32767), boundary.gamepad.rx);
+    try testing.expectEqual(@as(i16, -32768), boundary.gamepad.ry);
+}
+
+test "mapper: issue 491 omitted gamepad deadzone preserves passthrough" {
+    const allocator = testing.allocator;
+    const parsed = try makeMapping("", allocator);
+    defer parsed.deinit();
+
+    var m = try makeMapper(&parsed.value, allocator);
+    defer m.deinit();
+
+    const ev = try m.apply(.{ .ax = 100, .ay = -100, .rx = 100, .ry = -100 }, 16, 0);
+    try testing.expectEqual(@as(i16, 100), ev.gamepad.ax);
+    try testing.expectEqual(@as(i16, -100), ev.gamepad.ay);
+    try testing.expectEqual(@as(i16, 100), ev.gamepad.rx);
+    try testing.expectEqual(@as(i16, -100), ev.gamepad.ry);
+}
+
 test "mapper: dpad prev mask: suppress_dpad_hat applied to masked_prev" {
     const allocator = testing.allocator;
     const parsed = try makeMapping(
@@ -3699,12 +3995,14 @@ test "mapper: toggle layer switch resets processors" {
 
     // Dirty processor state to simulate residual accumulation
     m.gyro_proc.ema_y = -200.0;
+    m.last_gyro_joystick_axes.ry = -2345;
     m.stick_right.mouse_accum_y = 0.8;
 
     // Frame 2: Select released → toggle fires → active_changed = true → reset
     _ = try m.apply(.{ .buttons = 0 }, 16, 0);
 
     try testing.expectEqual(@as(f32, 0), m.gyro_proc.ema_y);
+    try testing.expect(m.last_gyro_joystick_axes.ry == null);
     try testing.expectEqual(@as(f32, 0), m.stick_right.mouse_accum_y);
 }
 

@@ -24,6 +24,11 @@ fn applyLibusbInclude(b: *std.Build, mod: *std.Build.Module, use_libusb: bool, v
     }
 }
 
+fn addCompletionAssets(b: *std.Build, mod: *std.Build.Module) void {
+    const assets = b.createModule(.{ .root_source_file = b.path("completions/assets.zig") });
+    mod.addImport("completion_assets", assets);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -86,6 +91,7 @@ pub fn build(b: *std.Build) void {
     });
     src_mod.addImport("toml", toml_mod);
     src_mod.addImport("build_options", build_opts.createModule());
+    addCompletionAssets(b, src_mod);
     applyLibusbInclude(b, src_mod, use_libusb, vendored);
     if (use_wasm) addWasm3(b, src_mod, wasm3_c_flags);
 
@@ -204,6 +210,11 @@ pub fn build(b: *std.Build) void {
     bazzite_setup_test_step.dependOn(&bazzite_setup_tests.step);
     test_step.dependOn(&bazzite_setup_tests.step);
 
+    const shell_completion_tests = b.addSystemCommand(&.{ "bash", "scripts/test-shell-completions.sh" });
+    const shell_completion_test_step = b.step("test-shell-completions", "Run Bash and optional Zsh completion tests");
+    shell_completion_test_step.dependOn(&shell_completion_tests.step);
+    test_step.dependOn(&shell_completion_tests.step);
+
     // cli_smoke: run the just-built artifact, not a possibly stale zig-out binary.
     const smoke_version = b.addRunArtifact(exe);
     smoke_version.addArg("--version");
@@ -214,9 +225,10 @@ pub fn build(b: *std.Build) void {
     smoke_help.addArg("--help");
     smoke_help.expectExitCode(0);
     for (&[_][]const u8{
-        "install", "uninstall", "scan",   "list-mappings",
-        "reload",  "switch",    "status", "devices",
-        "dump",
+        "install", "uninstall", "scan",           "list-mappings",
+        "reload",  "switch",    "output-profile", "status",
+        "devices", "doctor",    "dump",           "config",
+        "--scope",
     }) |cmd| {
         smoke_help.addCheck(.{ .expect_stdout_match = cmd });
     }
@@ -228,6 +240,20 @@ pub fn build(b: *std.Build) void {
     smoke_validate.expectExitCode(0);
     smoke_validate.addCheck(.{ .expect_stdout_match = ": OK" });
     test_step.dependOn(&smoke_validate.step);
+
+    const smoke_validate_inline = b.addRunArtifact(exe);
+    smoke_validate_inline.addArg("--validate=devices/sony/dualsense.toml");
+    smoke_validate_inline.addFileInput(b.path("devices/sony/dualsense.toml"));
+    smoke_validate_inline.expectExitCode(0);
+    smoke_validate_inline.addCheck(.{ .expect_stdout_match = ": OK" });
+    test_step.dependOn(&smoke_validate_inline.step);
+
+    const smoke_mapping_names = b.addRunArtifact(exe);
+    smoke_mapping_names.addArgs(&.{ "list-mappings", "--config-dir=devices/sony", "--names" });
+    smoke_mapping_names.addFileInput(b.path("devices/sony/dualsense.toml"));
+    smoke_mapping_names.expectExitCode(0);
+    smoke_mapping_names.addCheck(.{ .expect_stdout_match = "dualsense" });
+    test_step.dependOn(&smoke_mapping_names.step);
 
     // test-integration: Layer 2 (UHID, requires privilege)
     const integration_step = b.step("test-integration", "Run Layer 2 integration tests (UHID, local)");
@@ -307,9 +333,10 @@ pub fn build(b: *std.Build) void {
     shadow_int_tests.linkLibC();
     integration_step.dependOn(&b.addRunArtifact(shadow_int_tests).step);
 
-    // uinput_ff_erase_integration: real UI_FF_ERASE wiring validation.
-    // Creates an FF_RUMBLE uinput device, EVIOCSFF-uploads then EVIOCRMFF-erases
-    // an effect (no EV_FF=0), and asserts pollFf surfaces a zero-magnitude stop.
+    // uinput FF integration: real PLAY/STOP ordering and UI_FF_ERASE wiring.
+    // Creates FF_RUMBLE uinput devices and drives them through real evdev
+    // clients. A hard process watchdog backs up the harness's bounded ioctl
+    // cancellation so a kernel handshake regression cannot hang CI forever.
     // Own test artifact like shadow_grab; skips gracefully without /dev/uinput
     // unless PADCTL_TEST_REQUIRE_UINPUT=1 (set by the privileged e2e job).
     const ff_erase_int_mod = b.createModule(.{
@@ -323,6 +350,13 @@ pub fn build(b: *std.Build) void {
     const ff_erase_int_tests = b.addTest(.{ .root_module = ff_erase_int_mod, .filters = test_filters });
     applyLibusb(b, ff_erase_int_tests, use_libusb, vendored);
     ff_erase_int_tests.linkLibC();
+    ff_erase_int_tests.setExecCmd(&.{
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=2s",
+        "30s",
+        null,
+    });
     integration_step.dependOn(&b.addRunArtifact(ff_erase_int_tests).step);
 
     // Phase 13 Wave 3 T5f: Layer 1 routing tests — pure pipe2 fixture, no
@@ -497,6 +531,7 @@ fn createTestRootModule(
     mod.addImport("toml_gen", capture_toml_gen_mod);
     mod.addImport("capture_resolve", capture_resolve_mod);
     mod.addImport("build_options", build_opts.createModule());
+    addCompletionAssets(b, mod);
     return mod;
 }
 
@@ -519,6 +554,7 @@ fn createSrcModule(
         .sanitize_c = .trap,
         .sanitize_thread = sanitize_thread,
     });
+    addCompletionAssets(b, mod);
     mod.addImport("toml", toml_mod);
     mod.addImport("build_options", build_opts.createModule());
     applyLibusbInclude(b, mod, use_libusb, vendored);

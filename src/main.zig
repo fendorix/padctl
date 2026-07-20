@@ -125,6 +125,7 @@ pub const testing_support = struct {
     pub const bugfix_regression_test = @import("test/bugfix_regression_test.zig");
     pub const doctor_accuracy_test = @import("test/doctor_accuracy_test.zig");
     pub const event_loop_rumble_test = @import("test/event_loop_rumble_test.zig");
+    pub const rumble_trace_corpus_test = @import("test/rumble_trace_corpus_test.zig");
     pub const event_loop_ff_erase_test = @import("test/event_loop_ff_erase_test.zig");
     pub const uhid_output_dispatch_test = @import("test/uhid_output_dispatch_test.zig");
     pub const uhid_t1_strict_red_green_test = @import("test/uhid_t1_strict_red_green_test.zig");
@@ -216,6 +217,12 @@ fn parseScope(v: []const u8) ?cli.install.LifecycleScope {
     return null;
 }
 
+fn inlineOptionValue(arg: []const u8, option: []const u8) ?[]const u8 {
+    if (arg.len <= option.len or arg[option.len] != '=') return null;
+    if (!std.mem.eql(u8, arg[0..option.len], option)) return null;
+    return arg[option.len + 1 ..];
+}
+
 fn reportScopeOrLog(err: anyerror, phase_name: []const u8) void {
     switch (err) {
         error.NonRootSystemPrefix => {
@@ -253,6 +260,7 @@ const Cli = struct {
     scan_config_dir: ?[]const u8 = null,
     list_mappings: bool = false,
     list_mappings_config_dir: ?[]const u8 = null,
+    list_mappings_names: bool = false,
     reload: bool = false,
     reload_pid: ?[]const u8 = null,
     pid_file: ?[]const u8 = null,
@@ -317,8 +325,16 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     std.process.exit(0);
                 } else if (std.mem.eql(u8, iarg, "--prefix")) {
                     opts.prefix = args.next() orelse return error.MissingArgValue;
+                } else if (inlineOptionValue(iarg, "--prefix")) |value| {
+                    opts.prefix = value;
                 } else if (std.mem.eql(u8, iarg, "--destdir")) {
                     opts.destdir = args.next() orelse return error.MissingArgValue;
+                    validateDestdir(opts.destdir) catch {
+                        cli.errors.message(stderr_writer, "--destdir must be an absolute path");
+                        return error.UnknownArgument;
+                    };
+                } else if (inlineOptionValue(iarg, "--destdir")) |value| {
+                    opts.destdir = value;
                     validateDestdir(opts.destdir) catch {
                         cli.errors.message(stderr_writer, "--destdir must be an absolute path");
                         return error.UnknownArgument;
@@ -329,6 +345,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     opts.no_immutable = true;
                 } else if (std.mem.eql(u8, iarg, "--mapping")) {
                     try mapping_list.append(allocator, args.next() orelse return error.MissingArgValue);
+                } else if (inlineOptionValue(iarg, "--mapping")) |value| {
+                    try mapping_list.append(allocator, value);
                 } else if (std.mem.eql(u8, iarg, "--force-mapping")) {
                     opts.force_mapping = true;
                 } else if (std.mem.eql(u8, iarg, "--force-binding")) {
@@ -344,6 +362,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                 } else if (std.mem.eql(u8, iarg, "--scope")) {
                     const v = args.next() orelse return error.MissingArgValue;
                     opts.scope = parseScope(v) orelse {
+                        cli.errors.message(stderr_writer, "invalid --scope value (expected system|user|package)");
+                        return error.UnknownArgument;
+                    };
+                } else if (inlineOptionValue(iarg, "--scope")) |value| {
+                    opts.scope = parseScope(value) orelse {
                         cli.errors.message(stderr_writer, "invalid --scope value (expected system|user|package)");
                         return error.UnknownArgument;
                     };
@@ -364,8 +387,16 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     std.process.exit(0);
                 } else if (std.mem.eql(u8, iarg, "--prefix")) {
                     opts.prefix = args.next() orelse return error.MissingArgValue;
+                } else if (inlineOptionValue(iarg, "--prefix")) |value| {
+                    opts.prefix = value;
                 } else if (std.mem.eql(u8, iarg, "--destdir")) {
                     opts.destdir = args.next() orelse return error.MissingArgValue;
+                    validateDestdir(opts.destdir) catch {
+                        cli.errors.message(stderr_writer, "--destdir must be an absolute path");
+                        return error.UnknownArgument;
+                    };
+                } else if (inlineOptionValue(iarg, "--destdir")) |value| {
+                    opts.destdir = value;
                     validateDestdir(opts.destdir) catch {
                         cli.errors.message(stderr_writer, "--destdir must be an absolute path");
                         return error.UnknownArgument;
@@ -376,9 +407,16 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     opts.no_immutable = true;
                 } else if (std.mem.eql(u8, iarg, "--mapping")) {
                     try mapping_list.append(allocator, args.next() orelse return error.MissingArgValue);
+                } else if (inlineOptionValue(iarg, "--mapping")) |value| {
+                    try mapping_list.append(allocator, value);
                 } else if (std.mem.eql(u8, iarg, "--scope")) {
                     const v = args.next() orelse return error.MissingArgValue;
                     opts.scope = parseScope(v) orelse {
+                        cli.errors.message(stderr_writer, "invalid --scope value (expected system|user|package)");
+                        return error.UnknownArgument;
+                    };
+                } else if (inlineOptionValue(iarg, "--scope")) |value| {
+                    opts.scope = parseScope(value) orelse {
                         cli.errors.message(stderr_writer, "invalid --scope value (expected system|user|package)");
                         return error.UnknownArgument;
                     };
@@ -399,6 +437,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     std.process.exit(0);
                 } else if (std.mem.eql(u8, sub_arg, "--config-dir")) {
                     parsed_cli.scan_config_dir = args.next() orelse return error.MissingArgValue;
+                } else if (inlineOptionValue(sub_arg, "--config-dir")) |value| {
+                    parsed_cli.scan_config_dir = value;
                 } else {
                     cli.errors.unknownArgument(stderr_writer, sub_arg);
                     return error.UnknownArgument;
@@ -412,6 +452,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     std.process.exit(0);
                 } else if (std.mem.eql(u8, sub_arg, "--config-dir")) {
                     parsed_cli.list_mappings_config_dir = args.next() orelse return error.MissingArgValue;
+                } else if (inlineOptionValue(sub_arg, "--config-dir")) |value| {
+                    parsed_cli.list_mappings_config_dir = value;
+                } else if (std.mem.eql(u8, sub_arg, "--names")) {
+                    parsed_cli.list_mappings_names = true;
                 } else {
                     cli.errors.unknownArgument(stderr_writer, sub_arg);
                     return error.UnknownArgument;
@@ -419,20 +463,33 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
             }
         } else if (std.mem.eql(u8, arg, "--config")) {
             parsed_cli.config_path = args.next() orelse return error.MissingArgValue;
+        } else if (inlineOptionValue(arg, "--config")) |value| {
+            parsed_cli.config_path = value;
         } else if (std.mem.eql(u8, arg, "--config-dir")) {
             parsed_cli.config_dir = args.next() orelse return error.MissingArgValue;
+        } else if (inlineOptionValue(arg, "--config-dir")) |value| {
+            parsed_cli.config_dir = value;
         } else if (std.mem.eql(u8, arg, "--mapping")) {
             parsed_cli.mapping_path = args.next() orelse return error.MissingArgValue;
+        } else if (inlineOptionValue(arg, "--mapping")) |value| {
+            parsed_cli.mapping_path = value;
         } else if (std.mem.eql(u8, arg, "--validate")) {
             in_validate = true;
             const first = args.next() orelse return error.MissingArgValue;
             try parsed_cli.validate_files.append(allocator, first);
+        } else if (inlineOptionValue(arg, "--validate")) |value| {
+            in_validate = true;
+            try parsed_cli.validate_files.append(allocator, value);
         } else if (std.mem.eql(u8, arg, "--pid-file")) {
             parsed_cli.pid_file = args.next() orelse return error.MissingArgValue;
+        } else if (inlineOptionValue(arg, "--pid-file")) |value| {
+            parsed_cli.pid_file = value;
         } else if (std.mem.eql(u8, arg, "--doc-gen")) {
             parsed_cli.doc_gen = true;
         } else if (std.mem.eql(u8, arg, "--output")) {
             parsed_cli.doc_gen_output = args.next() orelse return error.MissingArgValue;
+        } else if (inlineOptionValue(arg, "--output")) |value| {
+            parsed_cli.doc_gen_output = value;
         } else if (std.mem.eql(u8, arg, "reload")) {
             parsed_cli.reload = true;
             while (args.next()) |sub_arg| {
@@ -441,6 +498,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     std.process.exit(0);
                 } else if (std.mem.eql(u8, sub_arg, "--pid")) {
                     parsed_cli.reload_pid = args.next() orelse return error.MissingArgValue;
+                } else if (inlineOptionValue(sub_arg, "--pid")) |value| {
+                    parsed_cli.reload_pid = value;
                 } else {
                     cli.errors.unknownArgument(stderr_writer, sub_arg);
                     return error.UnknownArgument;
@@ -464,6 +523,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                         std.process.exit(0);
                     } else if (std.mem.eql(u8, iarg, "--device")) {
                         device = args.next() orelse return error.MissingArgValue;
+                    } else if (inlineOptionValue(iarg, "--device")) |value| {
+                        device = value;
                     } else if (cli.config.init.isPresetArg(iarg)) {
                         cli.errors.message(stderr_writer, cli.config.init.preset_removed_message);
                         return error.UnknownArgument;
@@ -496,8 +557,12 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                         std.process.exit(0);
                     } else if (std.mem.eql(u8, targ, "--config")) {
                         test_config = args.next() orelse return error.MissingArgValue;
+                    } else if (inlineOptionValue(targ, "--config")) |value| {
+                        test_config = value;
                     } else if (std.mem.eql(u8, targ, "--mapping")) {
                         test_mapping = args.next() orelse return error.MissingArgValue;
+                    } else if (inlineOptionValue(targ, "--mapping")) |value| {
+                        test_mapping = value;
                     } else if (std.mem.eql(u8, targ, "--raw")) {
                         test_raw = true;
                     } else if (targ.len > 0 and targ[0] == '-') {
@@ -551,8 +616,13 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     std.process.exit(0);
                 } else if (std.mem.eql(u8, sub_arg, "--device")) {
                     device_id = args.next() orelse return error.MissingArgValue;
+                } else if (inlineOptionValue(sub_arg, "--device")) |value| {
+                    device_id = value;
                 } else if (std.mem.eql(u8, sub_arg, "--socket")) {
                     parsed_cli.socket_path = args.next() orelse return error.MissingArgValue;
+                    parsed_cli.socket_explicit = true;
+                } else if (inlineOptionValue(sub_arg, "--socket")) |value| {
+                    parsed_cli.socket_path = value;
                     parsed_cli.socket_explicit = true;
                 } else if (std.mem.eql(u8, sub_arg, "--persist")) {
                     persist = true;
@@ -577,6 +647,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                 } else if (std.mem.eql(u8, sub_arg, "--socket")) {
                     parsed_cli.socket_path = args.next() orelse return error.MissingArgValue;
                     parsed_cli.socket_explicit = true;
+                } else if (inlineOptionValue(sub_arg, "--socket")) |value| {
+                    parsed_cli.socket_path = value;
+                    parsed_cli.socket_explicit = true;
                 } else {
                     cli.errors.unknownArgument(stderr_writer, sub_arg);
                     return error.UnknownArgument;
@@ -591,6 +664,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                 } else if (std.mem.eql(u8, sub_arg, "--socket")) {
                     parsed_cli.socket_path = args.next() orelse return error.MissingArgValue;
                     parsed_cli.socket_explicit = true;
+                } else if (inlineOptionValue(sub_arg, "--socket")) |value| {
+                    parsed_cli.socket_path = value;
+                    parsed_cli.socket_explicit = true;
                 } else {
                     cli.errors.unknownArgument(stderr_writer, sub_arg);
                     return error.UnknownArgument;
@@ -604,6 +680,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Cli {
                     std.process.exit(0);
                 } else if (std.mem.eql(u8, sub_arg, "--socket")) {
                     parsed_cli.socket_path = args.next() orelse return error.MissingArgValue;
+                    parsed_cli.socket_explicit = true;
+                } else if (inlineOptionValue(sub_arg, "--socket")) |value| {
+                    parsed_cli.socket_path = value;
                     parsed_cli.socket_explicit = true;
                 } else {
                     cli.errors.unknownArgument(stderr_writer, sub_arg);
@@ -716,10 +795,10 @@ fn printHelp() void {
 
 pub const help_text =
     \\Usage: padctl [options]
-    \\       padctl install [--prefix /usr] [--immutable] [--mapping <name>...]
-    \\       padctl uninstall [--prefix /usr] [--immutable] [--mapping <name>...]
+    \\       padctl install [--prefix /usr] [--immutable] [--scope system|user|package] [--mapping <name>...]
+    \\       padctl uninstall [--prefix /usr] [--immutable] [--scope system|user|package] [--mapping <name>...]
     \\       padctl scan [--config-dir <dir>]
-    \\       padctl list-mappings [--config-dir <dir>]
+    \\       padctl list-mappings [--config-dir <dir>] [--names]
     \\       padctl reload [--pid <pid>]
     \\       padctl switch <name> [--device <id>] [--socket <path>]
     \\       padctl output-profile list [--device <name>]
@@ -744,16 +823,19 @@ pub const help_text =
     \\    --no-user-service   Skip user-service enable/start (even under sudo)
     \\    --no-enable         Skip systemctl enable
     \\    --no-start          Skip systemctl start
+    \\    --scope <scope>     Installation scope: system, user, or package
     \\  uninstall             Remove installed files, stop and disable service
     \\    --prefix <dir>      Installation prefix (default: /usr)
     \\    --destdir <dir>     Staging root for package builds (default: "")
     \\    --no-immutable      Force standard uninstall even on detected immutable OS
     \\    --immutable         Also remove immutable-specific files from /etc/
     \\    --mapping <name>    Remove a specific mapping from /etc/padctl/mappings/ (repeatable)
+    \\    --scope <scope>     Uninstallation scope: system, user, or package
     \\  scan                  List connected HID devices and config match status
     \\    --config-dir <dir>  Search for device configs here (default: XDG paths)
     \\  list-mappings         List discovered mapping profiles from XDG paths
     \\    --config-dir <dir>  Also show device-specific mappings from this directory
+    \\    --names             Print mapping names only, one per line
     \\  reload [--pid <pid>]  Reload device configs; verifies via the control socket (SIGHUP fallback)
     \\  switch [name]         Switch mapping (omit name to re-apply from user config)
     \\    --persist           Copy mapping + config to /etc/padctl/ (survives reboot, uses sudo)
@@ -1096,7 +1178,11 @@ pub fn main() !void {
 
     // list-mappings subcommand
     if (parsed.list_mappings) {
-        cli.list_mappings.run(allocator, parsed.list_mappings_config_dir, stdout_writer) catch |err| {
+        const result = if (parsed.list_mappings_names)
+            cli.list_mappings.runNames(allocator, parsed.list_mappings_config_dir, stdout_writer)
+        else
+            cli.list_mappings.run(allocator, parsed.list_mappings_config_dir, stdout_writer);
+        result catch |err| {
             std.log.err("list-mappings failed: {}", .{err});
             std.process.exit(1);
         };
@@ -2135,6 +2221,8 @@ pub fn parseDumpFromSlice(args: []const []const u8) !struct {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             result.period = args[i];
+        } else if (inlineOptionValue(args[i], "--period")) |value| {
+            result.period = value;
         } else if (std.mem.eql(u8, args[i], "-o")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -2143,6 +2231,8 @@ pub fn parseDumpFromSlice(args: []const []const u8) !struct {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             result.socket_path = args[i];
+        } else if (inlineOptionValue(args[i], "--socket")) |value| {
+            result.socket_path = value;
         } else {
             return error.UnknownArgument;
         }
@@ -2176,6 +2266,19 @@ test "main: parseDumpFromSlice: export with period and output" {
     try testing.expectEqual(@as(@TypeOf(r.cmd), .@"export"), r.cmd);
     try testing.expectEqualStrings("2h", r.period);
     try testing.expectEqualStrings("/tmp/out.log", r.output_path.?);
+}
+
+test "main: parseDumpFromSlice: accepts inline long option values" {
+    const r = try parseDumpFromSlice(&.{ "export", "--period=30m", "--socket=/tmp/padctl.sock" });
+    try testing.expectEqualStrings("30m", r.period);
+    try testing.expectEqualStrings("/tmp/padctl.sock", r.socket_path.?);
+}
+
+test "main: inlineOptionValue matches exact long option" {
+    try testing.expectEqualStrings("user", inlineOptionValue("--scope=user", "--scope").?);
+    try testing.expectEqualStrings("", inlineOptionValue("--scope=", "--scope").?);
+    try testing.expect(inlineOptionValue("--scoped=user", "--scope") == null);
+    try testing.expect(inlineOptionValue("--scope", "--scope") == null);
 }
 
 test "main: parseDumpFromSlice: export default period" {
