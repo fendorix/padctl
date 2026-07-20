@@ -130,6 +130,8 @@ mkdir -p %{buildroot}/etc/padctl/mappings
 %{_modulesloaddir}/padctl.conf
 # Device config database
 %{_datadir}/padctl/
+%{_datadir}/bash-completion/completions/padctl.bash
+%{_datadir}/zsh/site-functions/_padctl
 # Runtime config directories
 %dir /etc/padctl
 %dir /etc/padctl/mappings
