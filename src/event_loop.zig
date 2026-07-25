@@ -176,6 +176,12 @@ fn slotStr(buf: *const [256]u8) []const u8 {
 const RUMBLE_MIN_INTERVAL_NS: i128 = 10_000_000; // 10ms
 const RUMBLE_RETRY_INTERVAL_NS: i128 = 10_000_000; // 10ms
 const RUMBLE_MAX_RETRY_ATTEMPTS: u8 = 3;
+/// How many extra times to re-emit a {0,0} stop frame (in addition to the
+/// initial write) to work around USB controllers that drop frames when
+/// flooded with rapid magnitude updates.
+const RUMBLE_STOP_RESEND_COUNT: u8 = 2;
+/// Delay between stop-frame resends in nanoseconds.
+const RUMBLE_STOP_RESEND_INTERVAL_NS: i128 = 5_000_000; // 5 ms
 
 const RumbleEmitResult = enum {
     written,
@@ -295,6 +301,7 @@ fn quiesceTimersAndRumbleImpl(
     self.pending_rumble_frame = null;
     self.pending_rumble_deadline_ns = null;
     self.pending_rumble_retry_count = 0;
+    self.stop_resend_count = 0;
     if (dcfg) |cfg| {
         _ = emitRumbleFrame(devices, alloc, cfg, 0, 0, tag);
     }
@@ -442,6 +449,8 @@ pub const EventLoop = struct {
     pending_rumble_frame: ?RumbleScheduler.Frame,
     pending_rumble_deadline_ns: ?i128,
     pending_rumble_retry_count: u8,
+    /// Remaining stop-frame resends (counts down; 0 = idle).
+    stop_resend_count: u8 = 0,
     last_heartbeat_ns: i128 = 0,
     /// Last successfully emitted virtual button mask. Diagnostic tracing uses
     /// it to log output edges without flooding dumps with axis-only frames.
@@ -605,6 +614,7 @@ pub const EventLoop = struct {
             self.last_rumble_ns = 0;
         } else {
             self.last_rumble_ns = now_ns;
+            self.clearPendingRumble();
         }
     }
 
@@ -618,6 +628,7 @@ pub const EventLoop = struct {
         self.pending_rumble_frame = null;
         self.pending_rumble_deadline_ns = null;
         self.pending_rumble_retry_count = 0;
+        self.stop_resend_count = 0;
     }
 
     fn emitRumbleFrameForContext(self: *EventLoop, ctx: EventLoopContext, frame: RumbleScheduler.Frame, now_ns: i128) RumbleEmitResult {
@@ -671,9 +682,33 @@ pub const EventLoop = struct {
     }
 
     fn emitOrQueueRumble(self: *EventLoop, ctx: EventLoopContext, frame: RumbleScheduler.Frame, now_ns: i128) void {
+        const is_stop = frame.strong == 0 and frame.weak == 0;
+        if (is_stop and self.stop_resend_count == 0) {
+            self.stop_resend_count = RUMBLE_STOP_RESEND_COUNT;
+        }
         switch (self.emitRumbleFrameForContext(ctx, frame, now_ns)) {
-            .written, .unconfigured => {},
-            .write_failed => self.queueRumbleRetry(ctx, frame, now_ns),
+            .written, .unconfigured => {
+                if (is_stop and self.stop_resend_count > 0) {
+                    self.stop_resend_count -= 1;
+                    if (self.stop_resend_count > 0) {
+                        self.scheduleStopResend(now_ns);
+                    }
+                }
+            },
+            .write_failed => {
+                if (!is_stop) {
+                    self.queueRumbleRetry(ctx, frame, now_ns);
+                } else {
+                    // Stop frame resend will fire via scheduleStopResend,
+                    // do not consume the retry budget.
+                    if (self.stop_resend_count > 0) {
+                        self.stop_resend_count -= 1;
+                        if (self.stop_resend_count > 0) {
+                            self.scheduleStopResend(now_ns);
+                        }
+                    }
+                }
+            },
             .disconnected => self.handleRumbleDisconnect(ctx, frame),
         }
     }
@@ -714,6 +749,14 @@ pub const EventLoop = struct {
             .write_failed => self.queueRumbleRetry(ctx, frame, now_ns),
             .disconnected => self.handleRumbleDisconnect(ctx, frame),
         }
+    }
+
+    fn scheduleStopResend(self: *EventLoop, now_ns: i128) void {
+        const target_ns = now_ns + RUMBLE_STOP_RESEND_INTERVAL_NS;
+        self.pending_rumble_frame = RumbleScheduler.Frame{ .strong = 0, .weak = 0 };
+        self.pending_rumble_deadline_ns = target_ns;
+        self.pending_rumble_retry_count = 0;
+        armRumbleStopFd(self.rumble_stop_fd, target_ns);
     }
 
     fn armRumbleTimer(self: *EventLoop, scheduler_deadline_ns: ?i128) void {
