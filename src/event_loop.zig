@@ -291,6 +291,13 @@ fn quiesceTimersAndRumbleImpl(
     disarmTimer(self.macro_timer_fd);
     disarmTimer(self.rumble_stop_fd);
     self.rumble_scheduler = .{};
+    if (dcfg) |cfg| {
+        if (cfg.output) |out| {
+            if (out.force_feedback) |ff| {
+                self.rumble_scheduler.max_duration_ms = @intCast(ff.max_duration_ms orelse 0);
+            }
+        }
+    }
     self.last_rumble_ns = 0;
     self.pending_rumble_frame = null;
     self.pending_rumble_deadline_ns = null;
@@ -496,7 +503,7 @@ pub const EventLoop = struct {
             .device_base = 0,
             .timer_fd = timer_fd,
             .rumble_stop_fd = rumble_stop_fd,
-            .rumble_scheduler = .{},
+            .rumble_scheduler = .{ .max_duration_ms = 0 },
             .macro_timer_fd = macro_timer_fd,
             .uinput_ff_slot = null,
             .uhid_output_slot = null,

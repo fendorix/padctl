@@ -17,7 +17,7 @@ pub const MAX_EFFECTS = 16;
 pub const RumbleScheduler = struct {
     pub const Slot = struct {
         /// 0 = not playing.
-        /// INFINITE = playing with `replay.length == 0`.
+        /// INFINITE = playing with no cap (legacy).
         /// positive, < INFINITE = absolute monotonic deadline in nanoseconds.
         deadline_ns: i128 = 0,
         strong: u16 = 0,
@@ -31,6 +31,12 @@ pub const RumbleScheduler = struct {
 
     /// Per-effect state, indexed by FF effect id (0..MAX_EFFECTS-1).
     slots: [MAX_EFFECTS]Slot = @splat(.{}),
+
+    /// Cap any rumble duration longer than this value to prevent stuck
+    /// rumble effects.  The Linux FF emulator translates FF_INFINITE into a
+    /// duration of 65535 ms (= max u16), so this must cap both `0` and
+    /// `65535` to be effective.  0 means "no cap" (legacy behavior).
+    max_duration_ms: u32 = 0,
 
     /// Sentinel deadline for effects with infinite duration.
     pub const INFINITE: i128 = std.math.maxInt(i128);
@@ -47,16 +53,32 @@ pub const RumbleScheduler = struct {
     };
 
     /// Record that `effect_id` started playing with the given length.
-    /// `length_ms == 0` means infinite (never auto-stops on its own).
+    /// `length_ms == 0` or `length_ms == 65535` means infinite (the kernel's
+    /// FF emulator maps FF_INFINITE to 65535, the max u16 value).
     /// Out-of-range effect ids are ignored defensively.
     pub fn onPlay(self: *RumbleScheduler, effect_id: u8, strong: u16, weak: u16, length_ms: u16, now_ns: i128) ExpiryResult {
         const before = self.aggregateFrame();
         if (effect_id < MAX_EFFECTS) {
+            // The Linux FF emulator represents FF_INFINITE as 65535 ms
+            // (= max u16), so treat both `0` and `65535` as infinite.
+            // When a cap is configured we clamp infinite effects (and any
+            // finite duration that exceeds it) to the cap; otherwise
+            // infinite effects stay on the INFINITE sentinel.
+            const is_infinite: bool = length_ms == 0 or length_ms == 65535;
+            const capped_ms: u16 = if (is_infinite and self.max_duration_ms > 0)
+                @intCast(@min(self.max_duration_ms, 65535))
+            else if (is_infinite)
+                0
+            else if (self.max_duration_ms > 0)
+                @min(length_ms, @as(u16, @intCast(self.max_duration_ms)))
+            else
+                length_ms;
+            const effective_deadline: i128 = if (capped_ms == 0)
+                INFINITE
+            else
+                now_ns + @as(i128, capped_ms) * std.time.ns_per_ms;
             self.slots[effect_id] = .{
-                .deadline_ns = if (length_ms == 0)
-                    INFINITE
-                else
-                    now_ns + @as(i128, length_ms) * std.time.ns_per_ms,
+                .deadline_ns = effective_deadline,
                 .strong = strong,
                 .weak = weak,
             };
@@ -223,6 +245,58 @@ test "rumble_scheduler: infinite duration never contributes a deadline but stays
     const result = sched.onTimerExpired(now + 10 * std.time.ns_per_s);
     try expectNoFrame(result.frame);
     try testing.expectEqual(@as(?i128, null), result.next_deadline_ns);
+}
+
+test "rumble_scheduler: 65535ms is treated as infinite just like 0" {
+    var sched: RumbleScheduler = .{};
+    const now: i128 = 5_000_000_000;
+
+    // The kernel FF emulator maps FF_INFINITE to 65535 (= max u16), so
+    // the scheduler must treat it identically to length_ms == 0.
+    const next = sched.onPlay(1, 0x1000, 0x2000, 65535, now);
+    try expectFrame(next.frame, 0x1000, 0x2000);
+    try testing.expectEqual(@as(?i128, null), next.next_deadline_ns);
+}
+
+test "rumble_scheduler: max_duration_ms caps 65535ms effects" {
+    var sched: RumbleScheduler = .{ .max_duration_ms = 30000 };
+    const now: i128 = 0;
+
+    const next = sched.onPlay(0, 0x1000, 0x2000, 65535, now);
+    try expectFrame(next.frame, 0x1000, 0x2000);
+    const expected_dl = 30000 * std.time.ns_per_ms;
+    try testing.expectEqual(@as(?i128, expected_dl), next.next_deadline_ns);
+}
+
+test "rumble_scheduler: max_duration_ms caps 0ms (infinite) effects" {
+    var sched: RumbleScheduler = .{ .max_duration_ms = 10000 };
+    const now: i128 = 0;
+
+    const next = sched.onPlay(0, 0x1000, 0x2000, 0, now);
+    try expectFrame(next.frame, 0x1000, 0x2000);
+    const expected_dl = 10000 * std.time.ns_per_ms;
+    try testing.expectEqual(@as(?i128, expected_dl), next.next_deadline_ns);
+}
+
+test "rumble_scheduler: max_duration_ms caps excessive finite durations" {
+    var sched: RumbleScheduler = .{ .max_duration_ms = 5000 };
+    const now: i128 = 0;
+
+    // 12000ms exceeds the 5000ms cap — must be clamped down.
+    const next = sched.onPlay(0, 0x1000, 0x2000, 12000, now);
+    try expectFrame(next.frame, 0x1000, 0x2000);
+    const expected_dl = 5000 * std.time.ns_per_ms;
+    try testing.expectEqual(@as(?i128, expected_dl), next.next_deadline_ns);
+}
+
+test "rumble_scheduler: max_duration_ms does not clamp durations below the cap" {
+    var sched: RumbleScheduler = .{ .max_duration_ms = 5000 };
+    const now: i128 = 0;
+
+    const next = sched.onPlay(0, 0x1000, 0x2000, 2500, now);
+    try expectFrame(next.frame, 0x1000, 0x2000);
+    const expected_dl = 2500 * std.time.ns_per_ms;
+    try testing.expectEqual(@as(?i128, expected_dl), next.next_deadline_ns);
 }
 
 test "rumble_scheduler: long-then-short overlap does not prematurely emit stop" {

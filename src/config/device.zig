@@ -155,6 +155,11 @@ pub const ForceFeedbackConfig = struct {
     // When true padctl runs a userspace rumble auto-stop scheduler.
     // Set false for firmware that auto-stops internally.
     auto_stop: bool = true,
+    /// When auto_stop is true, cap any rumble duration (including the magic
+    /// 65535ms "infinite" sent by the Linux FF emulator) to this many
+    /// milliseconds to prevent stuck rumble effects.  0 means no cap (legacy
+    /// behavior).
+    max_duration_ms: ?i64 = null,
     // UHID PID passthrough fields.
     backend: []const u8 = "uinput", // "uinput" | "uhid"
     kind: []const u8 = "rumble", // "rumble" | "pid"
