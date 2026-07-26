@@ -17,7 +17,7 @@ pub const MAX_EFFECTS = 16;
 pub const RumbleScheduler = struct {
     pub const Slot = struct {
         /// 0 = not playing.
-        /// INFINITE = playing with `replay.length == 0`.
+        /// INFINITE = playing with no cap (legacy).
         /// positive, < INFINITE = absolute monotonic deadline in nanoseconds.
         deadline_ns: i128 = 0,
         strong: u16 = 0,
@@ -47,13 +47,15 @@ pub const RumbleScheduler = struct {
     };
 
     /// Record that `effect_id` started playing with the given length.
-    /// `length_ms == 0` means infinite (never auto-stops on its own).
+    /// `length_ms == 0` or `length_ms == 65535` means infinite (the kernel's
+    /// FF emulator maps FF_INFINITE to 65535, the max u16 value).
     /// Out-of-range effect ids are ignored defensively.
     pub fn onPlay(self: *RumbleScheduler, effect_id: u8, strong: u16, weak: u16, length_ms: u16, now_ns: i128) ExpiryResult {
         const before = self.aggregateFrame();
         if (effect_id < MAX_EFFECTS) {
+            const is_infinite: bool = length_ms == 0 or length_ms == 65535;
             self.slots[effect_id] = .{
-                .deadline_ns = if (length_ms == 0)
+                .deadline_ns = if (is_infinite)
                     INFINITE
                 else
                     now_ns + @as(i128, length_ms) * std.time.ns_per_ms,
@@ -223,6 +225,17 @@ test "rumble_scheduler: infinite duration never contributes a deadline but stays
     const result = sched.onTimerExpired(now + 10 * std.time.ns_per_s);
     try expectNoFrame(result.frame);
     try testing.expectEqual(@as(?i128, null), result.next_deadline_ns);
+}
+
+test "rumble_scheduler: 65535ms is treated as infinite just like 0" {
+    var sched: RumbleScheduler = .{};
+    const now: i128 = 5_000_000_000;
+
+    // The kernel FF emulator maps FF_INFINITE to 65535 (= max u16), so
+    // the scheduler must treat it identically to length_ms == 0.
+    const next = sched.onPlay(1, 0x1000, 0x2000, 65535, now);
+    try expectFrame(next.frame, 0x1000, 0x2000);
+    try testing.expectEqual(@as(?i128, null), next.next_deadline_ns);
 }
 
 test "rumble_scheduler: long-then-short overlap does not prematurely emit stop" {
