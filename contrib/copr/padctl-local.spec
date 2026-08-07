@@ -23,7 +23,7 @@
 %define debug_package %{nil}
 
 Name:           padctl
-Version:        0.1.25
+Version:        0.1.26
 Release:        1%{?dist}
 Summary:        HID gamepad remapper with declarative TOML config
 
